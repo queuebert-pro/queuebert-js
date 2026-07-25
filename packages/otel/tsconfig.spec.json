@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist/spec",
+    "isolatedModules": true,
+    "module": "nodenext",
+    "types": ["jest", "node"]
+  },
+  "include": ["src/**/*.ts"]
+}

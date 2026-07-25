@@ -1,0 +1,70 @@
+{
+  "name": "@queuebert/bullmq",
+  "version": "0.0.1",
+  "description": "BullMQ queue, worker, processor, and stats helpers for Queuebert-aware applications.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "package.json",
+    "!**/*.tsbuildinfo"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "bullmq",
+    "nestjs",
+    "queue",
+    "worker",
+    "queuebert"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/queuebert/queuebert-js.git",
+    "directory": "packages/bullmq"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "clean": "node ../../scripts/clean-package.mjs",
+    "build": "tsc -b tsconfig.lib.json",
+    "prepack": "npm run clean && npm run build"
+  },
+  "nx": {
+    "name": "bullmq",
+    "targets": {
+      "build": {
+        "dependsOn": [
+          "^build"
+        ]
+      }
+    }
+  },
+  "dependencies": {
+    "tslib": "^2.3.0"
+  },
+  "peerDependencies": {
+    "@nestjs/bullmq": ">=11.0.0 <12.0.0",
+    "@nestjs/common": ">=11.0.0 <12.0.0",
+    "@nestjs/core": ">=11.0.0 <12.0.0",
+    "@queuebert/nest": ">=0.0.1 <0.1.0",
+    "bullmq": ">=5.0.0 <6.0.0"
+  }
+}

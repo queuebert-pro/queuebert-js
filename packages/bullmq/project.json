@@ -1,0 +1,9 @@
+{
+  "name": "bullmq",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/bullmq/src",
+  "projectType": "library",
+  "tags": ["scope:queuebert", "type:package"],
+  "// targets": "to see all targets run: nx show project bullmq --web",
+  "targets": {}
+}

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI: 'true'
+      NX_DAEMON: 'false'
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20.18.0
+          cache: npm
+      - run: npm install --global npm@11.13.0
+      - run: npm ci
+      - name: Check version plan
+        if: github.event_name == 'pull_request'
+        run: |
+          if [[ -n "$(git tag --list 'v*')" ]]; then
+            npm run release:plan:check
+          else
+            echo "Skipping version-plan enforcement until the initial release tag exists."
+          fi
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run lint:scripts
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - run: npm run test:release-channel
+      - run: npm run build
+      - run: npm run test:redis
+      - run: npm run test:yalc
+      - run: npm run pack:check
+      - run: npm run audit:production

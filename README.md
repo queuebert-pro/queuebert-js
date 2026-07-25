@@ -1,109 +1,129 @@
-# QueuebertJs
+# Queuebert JS
 
-<a alt="Nx logo" href="https://nx.dev" target="_blank" rel="noreferrer"><img src="https://raw.githubusercontent.com/nrwl/nx/master/images/nx-logo.png" width="45"></a>
+Queuebert JS is the TypeScript package workspace for exposing BullMQ queue
+operations, queue statistics, migration controls, and OpenTelemetry helpers to
+Queuebert clients.
 
-✨ Your new, shiny [Nx workspace](https://nx.dev) is ready ✨.
+## Packages
 
-[Learn more about this workspace setup and its capabilities](https://nx.dev/nx-api/js?utm_source=nx_project&amp;utm_medium=readme&amp;utm_campaign=nx_projects) or run `npx nx graph` to visually explore what was created. Now, let's get you up to speed!
+| Package             | Purpose                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------ |
+| `@queuebert/nest`   | NestJS module that exposes Queuebert queue APIs for existing BullMQ queues.                            |
+| `@queuebert/bullmq` | BullMQ queue, worker, processor, and stats helpers for applications that want Queuebert-aware workers. |
+| `@queuebert/otel`   | Framework-agnostic OpenTelemetry helpers plus the `@queuebert/otel/nest` NestJS module.                |
 
-## Generate a library
-
-```sh
-npx nx g @nx/js:lib packages/pkg1 --publishable --importPath=@my-org/pkg1
-```
-
-## Run tasks
-
-To build the library use:
-
-```sh
-npx nx build pkg1
-```
-
-To run any task with Nx use:
+The packages are intentionally separate npm packages. Install only the pieces
+your service needs.
 
 ```sh
-npx nx <target> <project-name>
+npm install @queuebert/nest
+npm install @queuebert/bullmq
+npm install @queuebert/otel
 ```
 
-These targets are either [inferred automatically](https://nx.dev/concepts/inferred-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or defined in the `project.json` or `package.json` files.
+## Package Layout
 
-[More about running tasks in the docs &raquo;](https://nx.dev/features/run-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-## Versioning and releasing
-
-To version and release the library use
-
-```
-npx nx release
+```txt
+packages/
+  nest/      # @queuebert/nest
+  bullmq/    # @queuebert/bullmq
+  otel/      # @queuebert/otel and @queuebert/otel/nest
 ```
 
-Pass `--dry-run` to see what would happen without actually releasing the library.
+`@queuebert/nest` no longer contains nested integration subpackages. Use the
+top-level integration packages directly:
 
-[Learn more about Nx release &raquo;](https://nx.dev/features/manage-releases?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+```ts
+import { QueuebertModule } from '@queuebert/nest';
+import { BaseQueueProcessor, QueuebertBullMQModule } from '@queuebert/bullmq';
+import { QueuebertOTelModule } from '@queuebert/otel/nest';
+```
 
-## Keep TypeScript project references up to date
+## Development
 
-Nx automatically updates TypeScript [project references](https://www.typescriptlang.org/docs/handbook/project-references.html) in `tsconfig.json` files to ensure they remain accurate based on your project dependencies (`import` or `require` statements). This sync is automatically done when running tasks such as `build` or `typecheck`, which require updated references to function correctly.
-
-To manually trigger the process to sync the project graph dependencies information to the TypeScript project references, run the following command:
+Install dependencies from the workspace root:
 
 ```sh
-npx nx sync
+npm install
 ```
 
-You can enforce that the TypeScript project references are always in the correct state when running in CI by adding a step to your CI job configuration that runs the following command:
+Build packages in dependency order:
 
 ```sh
-npx nx sync:check
+npx tsc -p packages/nest/tsconfig.lib.json
+npx tsc -p packages/bullmq/tsconfig.lib.json
+npx tsc -p packages/otel/tsconfig.lib.json
 ```
 
-[Learn more about nx sync](https://nx.dev/reference/nx-commands#sync)
-
-## Set up CI!
-
-### Step 1
-
-To connect to Nx Cloud, run the following command:
+Run tests:
 
 ```sh
-npx nx connect
+npx jest --config packages/nest/jest.config.cts --runInBand --no-watchman
+npx jest --config packages/bullmq/jest.config.cts --runInBand --no-watchman
+npx jest --config packages/otel/jest.config.cts --runInBand --no-watchman
 ```
 
-Connecting to Nx Cloud ensures a [fast and scalable CI](https://nx.dev/ci/intro/why-nx-cloud?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) pipeline. It includes features such as:
-
-- [Remote caching](https://nx.dev/ci/features/remote-cache?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Task distribution across multiple machines](https://nx.dev/ci/features/distribute-task-execution?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Automated e2e test splitting](https://nx.dev/ci/features/split-e2e-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Task flakiness detection and rerunning](https://nx.dev/ci/features/flaky-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-### Step 2
-
-Use the following command to configure a CI workflow for your workspace:
+With a local Redis server running, exercise the real BullMQ migration path:
 
 ```sh
-npx nx g ci-workflow
+npm run test:redis
 ```
 
-[Learn more about Nx on CI](https://nx.dev/ci/intro/ci-with-nx#ready-get-started-with-your-provider?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+Run lint before publishing:
 
-## Install Nx Console
+```sh
+npx nx run-many -t lint --all
+```
 
-Nx Console is an editor extension that enriches your developer experience. It lets you run tasks, generate code, and improves code autocompletion in your IDE. It is available for VSCode and IntelliJ.
+Run the complete release gate with Redis available at
+`QUEUEBERT_REDIS_URL` (defaults to `redis://127.0.0.1:6379`):
 
-[Install Nx Console &raquo;](https://nx.dev/getting-started/editor-setup?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+```sh
+npm run release:check
+```
 
-## Useful links
+## Test packages locally with yalc
 
-Learn more:
+Build all three packages and publish them to the local yalc store:
 
-- [Learn more about this workspace setup](https://nx.dev/nx-api/js?utm_source=nx_project&amp;utm_medium=readme&amp;utm_campaign=nx_projects)
-- [Learn about Nx on CI](https://nx.dev/ci/intro/ci-with-nx?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Releasing Packages with Nx release](https://nx.dev/features/manage-releases?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [What are Nx plugins?](https://nx.dev/concepts/nx-plugins?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+```sh
+npm run yalc:publish
+```
 
-And join the Nx community:
-- [Discord](https://go.nx.dev/community)
-- [Follow us on X](https://twitter.com/nxdevtools) or [LinkedIn](https://www.linkedin.com/company/nrwl)
-- [Our Youtube channel](https://www.youtube.com/@nxdevtools)
-- [Our blog](https://nx.dev/blog?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+Then add them to a local consumer:
+
+```sh
+yalc add @queuebert/nest @queuebert/bullmq @queuebert/otel
+```
+
+After making library changes, rebuild and push the updated packages to every
+linked consumer:
+
+```sh
+npm run yalc:push
+```
+
+The packages are published in dependency order: `@queuebert/nest`,
+`@queuebert/bullmq`, then `@queuebert/otel`.
+
+Run the automated yalc smoke test to publish into an isolated local store and
+verify both ESM and CommonJS consumers:
+
+```sh
+npm run test:yalc
+```
+
+Check package contents before publishing:
+
+```sh
+npm pack --dry-run --workspace @queuebert/nest
+npm pack --dry-run --workspace @queuebert/bullmq
+npm pack --dry-run --workspace @queuebert/otel
+```
+
+## Publishing Notes
+
+Each package cleans and rebuilds its own `dist` directory during `prepack`, then
+publishes only `dist`, `README.md`, `LICENSE`, `CHANGELOG.md`, and
+`package.json`. Publish from a clean, reviewed commit after CI and the production
+dependency audit pass.

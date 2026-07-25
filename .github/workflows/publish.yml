@@ -1,0 +1,92 @@
+name: Publish packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'queuebert/queuebert-js'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: npm
+      url: https://www.npmjs.com/org/queuebert
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CI: 'true'
+      NX_DAEMON: 'false'
+
+    steps:
+      - name: Require a release tag
+        if: github.ref_type != 'tag'
+        run: |
+          echo "Select a v-prefixed release tag when manually running this workflow."
+          exit 1
+
+      - name: Check out the release
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require the release commit on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch origin "${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}"; then
+            echo "Release tag ${GITHUB_REF_NAME} does not point to a commit on ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Set up npm
+        run: npm install --global npm@11.13.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve release channel
+        id: release
+        run: npm run release:channel -- "${GITHUB_REF_NAME}"
+
+      - name: Verify release
+        run: npm run release:check
+
+      - name: Publish ${{ steps.release.outputs.version }} to ${{ steps.release.outputs.dist_tag }}
+        env:
+          DIST_TAG: ${{ steps.release.outputs.dist_tag }}
+          FIRST_RELEASE: ${{ steps.release.outputs.first_release }}
+          NPM_CONFIG_PROVENANCE: 'true'
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          args=(release publish --tag "${DIST_TAG}" --access public)
+          if [[ "${FIRST_RELEASE}" == "true" ]]; then
+            args+=(--first-release)
+          fi
+          npx nx "${args[@]}"

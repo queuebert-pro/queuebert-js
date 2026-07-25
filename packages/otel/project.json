@@ -1,0 +1,7 @@
+{
+  "name": "otel",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/otel/src",
+  "projectType": "library",
+  "tags": ["scope:queuebert", "type:package"]
+}

@@ -1,0 +1,82 @@
+{
+  "name": "@queuebert/otel",
+  "version": "0.0.1",
+  "description": "OpenTelemetry helper utilities and NestJS integration helpers for Queuebert queue metrics.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./nest": {
+      "types": "./dist/nest/index.d.ts",
+      "import": "./dist/nest/index.js",
+      "require": "./dist/nest/index.js",
+      "default": "./dist/nest/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "package.json",
+    "!**/*.tsbuildinfo"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "opentelemetry",
+    "bullmq",
+    "nestjs",
+    "metrics",
+    "queuebert"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/queuebert/queuebert-js.git",
+    "directory": "packages/otel"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "clean": "node ../../scripts/clean-package.mjs",
+    "build": "tsc -b tsconfig.lib.json",
+    "prepack": "npm run clean && npm run build"
+  },
+  "nx": {
+    "name": "otel",
+    "targets": {
+      "build": {
+        "dependsOn": [
+          "^build"
+        ]
+      }
+    }
+  },
+  "dependencies": {
+    "tslib": "^2.3.0"
+  },
+  "peerDependencies": {
+    "@nestjs/common": ">=11.0.0 <12.0.0",
+    "@opentelemetry/api": ">=1.9.0 <2.0.0",
+    "@queuebert/nest": ">=0.0.1 <0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/common": {
+      "optional": true
+    },
+    "@queuebert/nest": {
+      "optional": true
+    }
+  }
+}

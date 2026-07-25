@@ -2,22 +2,91 @@
   "name": "@queuebert-js/source",
   "version": "0.0.0",
   "license": "MIT",
-  "scripts": {},
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": ">=20.18.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "nx run-many -t build --all",
+    "lint": "nx run-many -t lint --all",
+    "lint:scripts": "eslint scripts",
+    "typecheck": "nx run-many -t typecheck --all",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "test": "jest -c jest.config.ts --runInBand --watchman=false",
+    "test:coverage": "jest -c jest.config.ts --coverage --runInBand --watchman=false",
+    "test:release-channel": "node --test scripts/resolve-release-channel.spec.mjs",
+    "test:redis": "node scripts/smoke-redis.mjs",
+    "test:yalc": "npm run build && node scripts/smoke-yalc.mjs",
+    "yalc:publish": "npm run build && node scripts/yalc-packages.mjs publish",
+    "yalc:push": "npm run build && node scripts/yalc-packages.mjs push",
+    "pack:check": "npm pack --dry-run --workspaces",
+    "audit:production": "npm audit --omit=dev",
+    "audit:tooling": "npm audit --audit-level=high",
+    "release:channel": "node scripts/resolve-release-channel.mjs",
+    "release:plan": "nx release plan",
+    "release:plan:check": "nx release plan:check",
+    "release:publish:dry-run": "nx release publish --dry-run",
+    "release:check": "npm run format:check && npm run lint && npm run lint:scripts && npm run typecheck && npm run test:coverage && npm run test:release-channel && npm run build && npm run test:redis && npm run test:yalc && npm run pack:check && npm run audit:production"
+  },
   "private": true,
   "devDependencies": {
+    "@eslint/js": "^9.8.0",
     "@nestjs/schematics": "^11.0.9",
-    "@nx/js": "22.4.5",
-    "@nx/nest": "22.4.5",
-    "@swc-node/register": "~1.11.1",
-    "@swc/core": "~1.15.11",
-    "@swc/helpers": "~0.5.18",
-    "nx": "22.4.5",
+    "@nestjs/testing": "^11.0.0",
+    "@nx/eslint": "^22.7.7",
+    "@nx/eslint-plugin": "^22.7.7",
+    "@nx/jest": "^22.7.7",
+    "@nx/js": "^22.7.7",
+    "@nx/nest": "^22.7.7",
+    "@opentelemetry/api": "^1.9.1",
+    "@swc-node/register": "1.11.1",
+    "@swc/core": "1.15.8",
+    "@swc/helpers": "0.5.21",
+    "@swc/jest": "~0.2.38",
+    "@types/jest": "^30.0.0",
+    "@types/node": "20.19.9",
+    "eslint": "^9.8.0",
+    "eslint-config-prettier": "^10.0.0",
+    "jest": "^30.0.2",
+    "jest-environment-node": "^30.0.2",
+    "jest-util": "^30.0.2",
+    "jsonc-eslint-parser": "^2.1.0",
+    "nx": "^22.7.7",
     "prettier": "~3.8.1",
+    "ts-jest": "^29.4.0",
+    "ts-node": "10.9.1",
     "tslib": "^2.8.1",
-    "typescript": "~5.9.3"
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.40.0",
+    "verdaccio": "^6.8.0",
+    "yalc": "1.0.0-pre.53"
   },
   "workspaces": [
     "packages/*"
   ],
-  "dependencies": {}
+  "dependencies": {
+    "@nestjs/bullmq": "^11.0.4",
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/platform-express": "^11.0.0",
+    "bullmq": "^5.66.4",
+    "ioredis": "^5.7.0",
+    "reflect-metadata": "^0.1.13",
+    "rxjs": "^7.8.0"
+  },
+  "nx": {
+    "includedScripts": [],
+    "targets": {
+      "local-registry": {
+        "executor": "@nx/js:verdaccio",
+        "options": {
+          "port": 4873,
+          "config": ".verdaccio/config.yml",
+          "storage": "tmp/local-registry/storage"
+        }
+      }
+    }
+  }
 }
