@@ -35,7 +35,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/queuebert/queuebert-js.git",
+    "url": "git+https://github.com/queuebert-pro/queuebert-js.git",
     "directory": "packages/nest"
   },
   "publishConfig": {

@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'queuebert/queuebert-js'
+    if: github.repository == 'queuebert-pro/queuebert-js'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
