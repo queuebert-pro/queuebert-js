@@ -4,7 +4,7 @@
   "license": "MIT",
   "packageManager": "npm@11.13.0",
   "engines": {
-    "node": ">=20.18.0",
+    "node": ">=24.0.0 <25",
     "npm": ">=10.0.0"
   },
   "scripts": {
@@ -14,8 +14,8 @@
     "typecheck": "nx run-many -t typecheck --all",
     "format:check": "prettier --check .",
     "format": "prettier --write .",
-    "test": "jest -c jest.config.ts --runInBand --watchman=false",
-    "test:coverage": "jest -c jest.config.ts --coverage --runInBand --watchman=false",
+    "test": "jest -c jest.config.cjs --runInBand --watchman=false",
+    "test:coverage": "jest -c jest.config.cjs --coverage --runInBand --watchman=false",
     "test:release-channel": "node --test scripts/resolve-release-channel.spec.mjs",
     "test:redis": "node scripts/smoke-redis.mjs",
     "test:yalc": "npm run build && node scripts/smoke-yalc.mjs",
@@ -46,7 +46,7 @@
     "@swc/helpers": "0.5.21",
     "@swc/jest": "~0.2.38",
     "@types/jest": "^30.0.0",
-    "@types/node": "20.19.9",
+    "@types/node": "24.13.3",
     "eslint": "^9.8.0",
     "eslint-config-prettier": "^10.0.0",
     "jest": "^30.0.2",

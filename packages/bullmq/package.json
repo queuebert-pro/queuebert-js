@@ -4,7 +4,7 @@
   "description": "BullMQ queue, worker, processor, and stats helpers for Queuebert-aware applications.",
   "license": "MIT",
   "engines": {
-    "node": ">=20.18.0"
+    "node": ">=24.0.0 <25"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -22,13 +22,7 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": [
-    "jest.config.ts",
-    "jest.config.cts",
-    "dist",
-    "src/**/*.spec.ts",
-    "src/**/*.test.ts"
-  ],
+  "exclude": ["dist", "src/**/*.spec.ts", "src/**/*.test.ts"],
   "references": [
     {
       "path": "../nest/tsconfig.lib.json"

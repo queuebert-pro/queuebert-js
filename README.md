@@ -41,6 +41,9 @@ import { QueuebertOTelModule } from '@queuebert/otel/nest';
 
 ## Development
 
+Use Node.js 24.18.0 (the repository includes `.nvmrc` and `.node-version`)
+with npm 11.13.0.
+
 Install dependencies from the workspace root:
 
 ```sh
@@ -58,9 +61,9 @@ npx tsc -p packages/otel/tsconfig.lib.json
 Run tests:
 
 ```sh
-npx jest --config packages/nest/jest.config.cts --runInBand --no-watchman
-npx jest --config packages/bullmq/jest.config.cts --runInBand --no-watchman
-npx jest --config packages/otel/jest.config.cts --runInBand --no-watchman
+npx jest --config packages/nest/jest.config.cjs --runInBand --no-watchman
+npx jest --config packages/bullmq/jest.config.cjs --runInBand --no-watchman
+npx jest --config packages/otel/jest.config.cjs --runInBand --no-watchman
 ```
 
 With a local Redis server running, exercise the real BullMQ migration path:
