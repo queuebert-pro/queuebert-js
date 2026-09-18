@@ -16,6 +16,7 @@ import {
   QUEUEBERT_OPTIONS,
   QUEUEBERT_QUEUES,
   DEFAULT_REDIS_INSTANCE_ID,
+  INSPECTABLE_JOB_STATES,
 } from './types';
 import type {
   QueuebertModuleOptions,
@@ -23,6 +24,7 @@ import type {
   QueuebertEndpoint,
   MigrationParams,
   MigrationJobState,
+  InspectableJobState,
   CacheMigrationParams,
 } from './types';
 
@@ -32,6 +34,8 @@ const VALID_MIGRATION_STATES: MigrationJobState[] = [
   'failed',
 ];
 const MAX_MIGRATION_LIMIT = 100_000;
+const DEFAULT_JOBS_PAGE_SIZE = 50;
+const MAX_JOBS_PAGE_SIZE = 100;
 const MAX_MIGRATION_BATCH_SIZE = 5_000;
 const MAX_MIGRATION_DELAY_MS = 60_000;
 
@@ -101,6 +105,22 @@ function parseMigrationStates(
   return parsedStates as MigrationJobState[];
 }
 
+function parseInspectableJobState(
+  value: string | undefined,
+): InspectableJobState {
+  if (value === undefined || value.trim() === '') return 'failed';
+
+  const state = value.trim();
+  if (!INSPECTABLE_JOB_STATES.includes(state as InspectableJobState)) {
+    throw new HttpException(
+      `state must be one of: ${INSPECTABLE_JOB_STATES.join(', ')}`,
+      HttpStatus.BAD_REQUEST,
+    );
+  }
+
+  return state as InspectableJobState;
+}
+
 /**
  * Interface for the public methods of QueuebertController
  * This allows us to define an explicit return type for the factory function
@@ -119,6 +139,14 @@ export interface IQueuebertController {
   ): Promise<unknown>;
   drainQueue(queueName: string): Promise<unknown>;
   getQueueMetrics(queueName: string): Promise<unknown>;
+  listQueueJobs(
+    queueName: string,
+    state?: string,
+    jobType?: string,
+    start?: string,
+    end?: string,
+  ): Promise<unknown>;
+  getQueueJob(queueName: string, jobId: string): Promise<unknown>;
   getMigrationQueues(): Promise<unknown>;
   listMigrations(): Promise<unknown>;
   previewMigration(
@@ -429,6 +457,79 @@ export function createQueuebertController(
         hasProcessor: !!processor,
         timestamp: new Date().toISOString(),
       };
+    }
+
+    /**
+     * GET /:queueName/jobs
+     * Read-only job inspection. Defaults to the failed state, which is the
+     * case this exists for.
+     *
+     * Requires the 'jobs' endpoint to be enabled; it is off by default because
+     * responses carry per-job failure reasons and stack traces.
+     */
+    @Get(':queueName/jobs')
+    async listQueueJobs(
+      @Param('queueName') queueName: string,
+      @Query('state') state?: string,
+      @Query('jobType') jobType?: string,
+      @Query('start') start?: string,
+      @Query('end') end?: string,
+    ) {
+      this.requireEndpoint('jobs');
+      const { queue } = this.getQueueByName(queueName);
+
+      const jobState = parseInspectableJobState(state);
+      const startIndex = parseNonNegativeInteger(start, 'start') ?? 0;
+      const endIndex =
+        parseNonNegativeInteger(end, 'end') ??
+        startIndex + DEFAULT_JOBS_PAGE_SIZE - 1;
+
+      if (endIndex < startIndex) {
+        throw new HttpException(
+          'end must be greater than or equal to start',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+      if (endIndex - startIndex + 1 > MAX_JOBS_PAGE_SIZE) {
+        throw new HttpException(
+          `start/end may span at most ${MAX_JOBS_PAGE_SIZE} jobs`,
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      return this._queuebertService.getJobList(queue, queueName, {
+        state: jobState,
+        jobType: jobType?.trim() || undefined,
+        start: startIndex,
+        end: endIndex,
+      });
+    }
+
+    /**
+     * GET /:queueName/jobs/:jobId
+     * Full detail for a single job, including its resolved current state.
+     */
+    @Get(':queueName/jobs/:jobId')
+    async getQueueJob(
+      @Param('queueName') queueName: string,
+      @Param('jobId') jobId: string,
+    ) {
+      this.requireEndpoint('jobs');
+      const { queue } = this.getQueueByName(queueName);
+
+      const detail = await this._queuebertService.getJobDetail(
+        queue,
+        queueName,
+        jobId,
+      );
+      if (!detail) {
+        throw new HttpException(
+          `Job '${jobId}' not found in queue '${queueName}'`,
+          HttpStatus.NOT_FOUND,
+        );
+      }
+
+      return detail;
     }
 
     /**

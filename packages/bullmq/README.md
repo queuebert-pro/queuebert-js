@@ -104,6 +104,49 @@ export class EmailProcessor extends BaseQueueProcessor {
 }
 ```
 
+### Per-job hooks
+
+`onJobFailed` fires for every failed attempt, before the error is rethrown to
+BullMQ. It exists so consumers do not have to re-derive "will BullMQ retry
+this?" in each processor's catch block:
+
+```ts
+@Injectable()
+@Processor('emails')
+export class EmailProcessor extends BaseQueueProcessor {
+  protected override async onJobFailed(
+    job: Job,
+    error: unknown,
+    ctx: JobFailureContext,
+  ) {
+    if (!ctx.isFinalAttempt) return;
+
+    Sentry.captureException(error, {
+      tags: { queue: 'emails', jobName: job.name },
+      extra: { jobId: job.id, attempt: ctx.attempt, max: ctx.maxAttempts },
+    });
+  }
+}
+```
+
+`ctx.isFinalAttempt` mirrors BullMQ's own retry decision and covers all three
+reasons it declines a retry: the attempt ceiling is reached, the handler called
+`job.discard()`, or the error is an `UnrecoverableError`. `ctx.discarded` and
+`ctx.unrecoverable` report those last two individually.
+
+One caveat: a custom `backoffStrategy` returning `-1` also stops retries, and
+that cannot be known without running the strategy. If you use one, treat
+`isFinalAttempt` as a lower bound.
+
+`ctx.attempt` is 1-based and equals `attemptsMade + 1`, which is what BullMQ
+compares against `opts.attempts` — `attemptsMade` has not been incremented yet
+when your handler throws.
+
+The hook is awaited, so an async reporter can flush before the job is moved to
+failed. A hook that throws is logged and swallowed; the original job error is
+always the one rethrown. `onJobCompleted(job, result, ctx)` is available for
+symmetry.
+
 Register that processor with `@queuebert/nest`:
 
 ```ts

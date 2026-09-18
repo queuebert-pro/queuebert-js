@@ -122,7 +122,47 @@ Supported optional endpoints are:
 - `resume`
 - `clean`
 - `drain`
+- `jobs`
 - `migrations`
+
+`jobs` is read-only but is still off by default: unlike `metrics`, which
+exposes aggregates, it returns per-job identifiers, failure reasons, and stack
+traces.
+
+## Job Inspection
+
+Enable the `jobs` endpoint to read individual jobs, which is the fastest way to
+work out why a job failed:
+
+```ts
+QueuebertModule.forRoot({
+  queues: [{ name: 'emails', processor: EmailProcessor }],
+  endpoints: ['metrics', 'jobs'],
+});
+```
+
+| Route                         | Returns                                           |
+| ----------------------------- | ------------------------------------------------- |
+| `GET /:queueName/jobs`        | A page of jobs plus the total for that state      |
+| `GET /:queueName/jobs/:jobId` | One job, with its state resolved via `getState()` |
+
+Query parameters on the list route:
+
+- `state` — one of `waiting`, `waiting-children`, `active`, `delayed`,
+  `prioritized`, `completed`, `failed`. Defaults to `failed`.
+- `start` / `end` — zero-based inclusive window. Defaults to the first 50 jobs
+  and may span at most 100.
+- `jobType` — narrow to jobs with a given name.
+
+Two behaviours worth knowing:
+
+- **Ordering is BullMQ's and varies by state.** `completed` and `failed` come
+  back newest-first; every other state comes back oldest-first.
+- **`jobType` filters within the page, not across the state.** The filter is
+  applied after the `start`/`end` window is read from Redis, so `jobs` can be
+  shorter than the requested page without that page being the last one. The
+  response sets `jobTypeFilter` whenever this applies, and `total` always
+  counts the whole state.
 
 ## Auth
 
@@ -222,16 +262,37 @@ must resume queues explicitly. Background progress is process-local and is
 available for one hour, so use a single long-lived Queuebert instance for a
 migration and use conservative limits and batches.
 
-Migration preview sample jobs redact raw BullMQ job payloads by default because
-job data often contains PII, tokens, or other application-specific secrets.
-Opt in only when the consuming client needs to display payloads:
+Job inspection responses and migration preview sample jobs withhold raw BullMQ
+job payloads by default because job data often contains PII, tokens, or other
+application-specific secrets. `includeJobData` governs both surfaces and covers
+`data` and `returnvalue`; opt in only when the consuming client needs to
+display payloads:
 
 ```ts
 QueuebertModule.forRoot({
   queues: [{ name: 'emails', processor: EmailProcessor }],
-  includeJobDataInMigrationPreview: true,
+  includeJobData: true,
 });
 ```
+
+`includeJobDataInMigrationPreview` is retained as a deprecated alias.
+`includeJobData` wins when both are set.
+
+For applications with their own scrubber, `jobRedaction` runs over every job
+that leaves either surface, after the `includeJobData` tier has been applied:
+
+```ts
+QueuebertModule.forRoot({
+  queues: [{ name: 'emails', processor: EmailProcessor }],
+  jobRedaction: (job) => ({
+    ...job,
+    failedReason: scrub(job.failedReason),
+  }),
+});
+```
+
+The hook must be synchronous. If it throws, the job is reduced to its `id`,
+`name`, and `state` rather than being returned unscrubbed.
 
 ## Cache Management
 

@@ -1,6 +1,10 @@
+import { UnrecoverableError } from 'bullmq';
+
 import {
   BaseQueueProcessor,
   type BaseQueueProcessorOptions,
+  type JobCompletionContext,
+  type JobFailureContext,
 } from './base-queue-processor';
 
 type EventHandler = (...args: any[]) => void;
@@ -349,5 +353,250 @@ describe('BaseQueueProcessor', () => {
     expect(logger.log).toHaveBeenCalledWith('custom heartbeat line');
 
     await processor.onModuleDestroy();
+  });
+
+  describe('per-job hooks', () => {
+    class HookProcessor extends BaseQueueProcessor {
+      public failures: Array<{ error: unknown; ctx: JobFailureContext }> = [];
+      public completions: Array<{
+        result: unknown;
+        ctx: JobCompletionContext;
+      }> = [];
+      public failWith: unknown = null;
+      public discardOnRun = false;
+      public hookThrows = false;
+
+      constructor() {
+        super({ queueName: 'emails', statsLogInterval: 60000 });
+      }
+
+      protected async processJob(job: any) {
+        if (this.discardOnRun) job.discard();
+        if (this.failWith) throw this.failWith;
+        return 'ok';
+      }
+
+      protected override onJobFailed(
+        _job: unknown,
+        error: unknown,
+        ctx: JobFailureContext,
+      ) {
+        if (this.hookThrows) throw new Error('hook exploded');
+        this.failures.push({ error, ctx });
+      }
+
+      protected override onJobCompleted(
+        _job: unknown,
+        result: unknown,
+        ctx: JobCompletionContext,
+      ) {
+        if (this.hookThrows) throw new Error('hook exploded');
+        this.completions.push({ result, ctx });
+      }
+    }
+
+    function createJob(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'job-1',
+        name: 'welcome',
+        data: {},
+        attemptsMade: 0,
+        opts: { attempts: 3 },
+        discard: jest.fn(),
+        ...overrides,
+      } as any;
+    }
+
+    it('reports a retryable attempt as not final', async () => {
+      const processor = new HookProcessor();
+      processor.failWith = new Error('processing failed');
+
+      await expect(processor.process(createJob())).rejects.toThrow(
+        'processing failed',
+      );
+
+      expect(processor.failures).toHaveLength(1);
+      expect(processor.failures[0].ctx).toMatchObject({
+        attempt: 1,
+        maxAttempts: 3,
+        isFinalAttempt: false,
+        discarded: false,
+        unrecoverable: false,
+      });
+      expect(processor.failures[0].ctx.durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it('counts the current attempt as attemptsMade + 1, matching BullMQ', async () => {
+      const processor = new HookProcessor();
+      processor.failWith = new Error('processing failed');
+
+      // BullMQ has not incremented attemptsMade yet when the handler throws,
+      // and decides retries on attemptsMade + 1 < opts.attempts.
+      await expect(
+        processor.process(createJob({ attemptsMade: 2 })),
+      ).rejects.toThrow('processing failed');
+
+      expect(processor.failures[0].ctx).toMatchObject({
+        attempt: 3,
+        maxAttempts: 3,
+        isFinalAttempt: true,
+      });
+    });
+
+    it('treats a missing opts.attempts as a single attempt', async () => {
+      const processor = new HookProcessor();
+      processor.failWith = new Error('processing failed');
+
+      await expect(processor.process(createJob({ opts: {} }))).rejects.toThrow(
+        'processing failed',
+      );
+
+      expect(processor.failures[0].ctx).toMatchObject({
+        attempt: 1,
+        maxAttempts: 1,
+        isFinalAttempt: true,
+      });
+    });
+
+    it('marks an UnrecoverableError final on the first attempt', async () => {
+      const processor = new HookProcessor();
+      processor.failWith = new UnrecoverableError('do not retry');
+
+      await expect(processor.process(createJob())).rejects.toThrow(
+        'do not retry',
+      );
+
+      expect(processor.failures[0].ctx).toMatchObject({
+        attempt: 1,
+        maxAttempts: 3,
+        unrecoverable: true,
+        isFinalAttempt: true,
+      });
+    });
+
+    it('recognises an UnrecoverableError by name across bullmq copies', async () => {
+      const foreign = new Error('do not retry');
+      foreign.name = 'UnrecoverableError';
+      const processor = new HookProcessor();
+      processor.failWith = foreign;
+
+      await expect(processor.process(createJob())).rejects.toThrow(
+        'do not retry',
+      );
+
+      expect(processor.failures[0].ctx).toMatchObject({
+        unrecoverable: true,
+        isFinalAttempt: true,
+      });
+    });
+
+    it('detects job.discard() and marks the attempt final', async () => {
+      const processor = new HookProcessor();
+      processor.discardOnRun = true;
+      processor.failWith = new Error('processing failed');
+      const job = createJob();
+
+      await expect(processor.process(job)).rejects.toThrow('processing failed');
+
+      expect(processor.failures[0].ctx).toMatchObject({
+        attempt: 1,
+        maxAttempts: 3,
+        discarded: true,
+        isFinalAttempt: true,
+      });
+      // The original discard still runs, so BullMQ's own flag is set too.
+      expect(job.discard).toHaveBeenCalledTimes(1);
+    });
+
+    it("restores the job's own discard after processing", async () => {
+      const processor = new HookProcessor();
+      const original = jest.fn();
+      const job = createJob({ discard: original });
+
+      await processor.process(job);
+
+      expect(job.discard).toBe(original);
+    });
+
+    it('calls onJobCompleted on success', async () => {
+      const processor = new HookProcessor();
+
+      await expect(processor.process(createJob())).resolves.toBe('ok');
+
+      expect(processor.failures).toHaveLength(0);
+      expect(processor.completions).toHaveLength(1);
+      expect(processor.completions[0].result).toBe('ok');
+      expect(processor.completions[0].ctx).toMatchObject({ attempt: 1 });
+    });
+
+    it('rethrows the job error even when the failure hook throws', async () => {
+      const processor = new HookProcessor();
+      processor.failWith = new Error('processing failed');
+      processor.hookThrows = true;
+      const logger = muteLogger(processor);
+
+      await expect(processor.process(createJob())).rejects.toThrow(
+        'processing failed',
+      );
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('onJobFailed hook threw'),
+      );
+    });
+
+    it('still resolves when the completion hook throws', async () => {
+      const processor = new HookProcessor();
+      processor.hookThrows = true;
+      const logger = muteLogger(processor);
+
+      await expect(processor.process(createJob())).resolves.toBe('ok');
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('onJobCompleted hook threw'),
+      );
+    });
+
+    it('awaits an async failure hook before rethrowing', async () => {
+      const order: string[] = [];
+
+      class AsyncHookProcessor extends BaseQueueProcessor {
+        constructor() {
+          super({ queueName: 'emails', statsLogInterval: 60000 });
+        }
+
+        protected async processJob() {
+          throw new Error('processing failed');
+        }
+
+        protected override async onJobFailed() {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          order.push('hook');
+        }
+      }
+
+      const processor = new AsyncHookProcessor();
+
+      await expect(processor.process(createJob())).rejects.toThrow(
+        'processing failed',
+      );
+      order.push('rethrow');
+
+      expect(order).toEqual(['hook', 'rethrow']);
+    });
+
+    it('still counts stats when hooks are in play', async () => {
+      const processor = new HookProcessor();
+      processor.failWith = new Error('processing failed');
+
+      await expect(processor.process(createJob())).rejects.toThrow(
+        'processing failed',
+      );
+
+      expect(processor.getProcessorStats().jobs).toMatchObject({
+        processed: 1,
+        completed: 0,
+        failed: 1,
+      });
+    });
   });
 });

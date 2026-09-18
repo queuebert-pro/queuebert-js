@@ -1,6 +1,6 @@
 import { WorkerHost } from '@nestjs/bullmq';
 import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Job, Worker } from 'bullmq';
+import { Job, UnrecoverableError, Worker } from 'bullmq';
 
 import type {
   QueuebertProcessor,
@@ -44,6 +44,64 @@ export interface BaseQueueProcessorOptions {
 }
 
 /**
+ * Context passed to `onJobFailed` describing where the failure sits in the
+ * job's retry lifecycle.
+ */
+export interface JobFailureContext {
+  /**
+   * 1-based number of the attempt that just failed.
+   *
+   * Mirrors BullMQ's own retry math, which compares `attemptsMade + 1` against
+   * `opts.attempts`. `attemptsMade` is not yet incremented when the handler
+   * throws, so this is the attempt you are currently in.
+   */
+  attempt: number;
+  /** Configured attempt ceiling (`opts.attempts`), defaulting to 1 */
+  maxAttempts: number;
+  /**
+   * True when BullMQ will not retry this job.
+   *
+   * Covers all three reasons BullMQ declines a retry: the attempt ceiling is
+   * reached, the handler called `job.discard()`, or the error is an
+   * `UnrecoverableError`.
+   *
+   * Caveat: a custom `backoffStrategy` returning -1 also stops retries, and
+   * that cannot be known without running the strategy. If you rely on one,
+   * treat this as a lower bound.
+   */
+  isFinalAttempt: boolean;
+  /** True when the handler called `job.discard()` during this attempt */
+  discarded: boolean;
+  /** True when the error is (or reports itself as) an `UnrecoverableError` */
+  unrecoverable: boolean;
+  /** Wall-clock ms spent in `processJob()` for this attempt */
+  durationMs: number;
+}
+
+/**
+ * Context passed to `onJobCompleted`.
+ */
+export interface JobCompletionContext {
+  /** 1-based number of the attempt that succeeded */
+  attempt: number;
+  /** Wall-clock ms spent in `processJob()` for this attempt */
+  durationMs: number;
+}
+
+/**
+ * Mirrors BullMQ's own check in `Job.shouldRetryJob()`, including the name
+ * fallback that catches an `UnrecoverableError` from a duplicate bullmq copy.
+ */
+function isUnrecoverableError(error: unknown): boolean {
+  if (error instanceof UnrecoverableError) return true;
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name === 'UnrecoverableError'
+  );
+}
+
+/**
  * Abstract base class for BullMQ queue processors that integrates with Queuebert.
  *
  * Provides out-of-the-box:
@@ -61,6 +119,8 @@ export interface BaseQueueProcessorOptions {
  * Subclasses may override:
  * - onProcessorInit()    — run custom init logic (cache setup, queue resume, etc.)
  * - onProcessorDestroy() — run custom cleanup (cache teardown, etc.)
+ * - onJobFailed()        — report a single job's failure (e.g. Sentry)
+ * - onJobCompleted()     — observe a single job's success
  * - getCustomStats()     — add domain-specific metrics to getProcessorStats()
  * - getCustomLogLines()  — append custom lines to the periodic heartbeat log
  * - getCacheConfigs()    — expose caches to Queuebert for management
@@ -283,6 +343,45 @@ export abstract class BaseQueueProcessor
     );
   }
 
+  /**
+   * Called when a single job attempt fails, before the error is rethrown to
+   * BullMQ. Override to add per-job error reporting (e.g., Sentry).
+   *
+   * `ctx.isFinalAttempt` saves every consumer from re-deriving "will BullMQ
+   * retry this?" in their own catch block — gate your reporting on it to avoid
+   * an event per attempt.
+   *
+   * Awaited, so an async reporter can flush before the job is moved to failed.
+   * A hook that throws is logged and swallowed; the original job error is
+   * always the one rethrown.
+   */
+  protected onJobFailed(
+    job: Job,
+    error: unknown,
+    ctx: JobFailureContext,
+  ): void | Promise<void> {
+    void job;
+    void error;
+    void ctx;
+  }
+
+  /**
+   * Called when a single job attempt succeeds, after stats are recorded and
+   * before the result is returned to BullMQ. Provided for symmetry with
+   * `onJobFailed`.
+   *
+   * Awaited, and a hook that throws is logged and swallowed.
+   */
+  protected onJobCompleted(
+    job: Job,
+    result: unknown,
+    ctx: JobCompletionContext,
+  ): void | Promise<void> {
+    void job;
+    void result;
+    void ctx;
+  }
+
   // ---------------------------------------------------------------------------
   // Abstract: subclasses implement their job handling here
   // ---------------------------------------------------------------------------
@@ -302,6 +401,9 @@ export abstract class BaseQueueProcessor
     this.jobsProcessed++;
     this.lastJobTime = new Date();
 
+    // BullMQ keeps the discard flag private, so observe the call instead.
+    const discardTracker = this.trackDiscard(job);
+
     try {
       const result = await this.processJob(job);
 
@@ -311,6 +413,13 @@ export abstract class BaseQueueProcessor
       this.jobsCompleted++;
       this.statsWindow.jobsCompletedInWindow++;
 
+      await this.runJobHook('onJobCompleted', () =>
+        this.onJobCompleted(job, result, {
+          attempt: (job.attemptsMade ?? 0) + 1,
+          durationMs: duration,
+        }),
+      );
+
       return result;
     } catch (error) {
       const duration = Date.now() - startTime;
@@ -318,7 +427,94 @@ export abstract class BaseQueueProcessor
 
       this.jobsFailed++;
 
+      const ctx = this.buildJobFailureContext(
+        job,
+        error,
+        duration,
+        discardTracker.wasDiscarded(),
+      );
+      await this.runJobHook('onJobFailed', () =>
+        this.onJobFailed(job, error, ctx),
+      );
+
       throw error;
+    } finally {
+      discardTracker.restore();
+    }
+  }
+
+  /**
+   * Derive retry-lifecycle context for a failed attempt, mirroring BullMQ's
+   * `Job.shouldRetryJob()`.
+   */
+  private buildJobFailureContext(
+    job: Job,
+    error: unknown,
+    durationMs: number,
+    discarded: boolean,
+  ): JobFailureContext {
+    const maxAttempts = job.opts?.attempts ?? 1;
+    const attempt = (job.attemptsMade ?? 0) + 1;
+    const unrecoverable = isUnrecoverableError(error);
+
+    return {
+      attempt,
+      maxAttempts,
+      isFinalAttempt: discarded || unrecoverable || attempt >= maxAttempts,
+      discarded,
+      unrecoverable,
+      durationMs,
+    };
+  }
+
+  /**
+   * Wrap `job.discard()` so the base class can tell whether the handler asked
+   * BullMQ to stop retrying. The flag itself is protected on BullMQ's Job.
+   */
+  private trackDiscard(job: Job): {
+    wasDiscarded: () => boolean;
+    restore: () => void;
+  } {
+    const original = job.discard;
+    if (typeof original !== 'function') {
+      return { wasDiscarded: () => false, restore: () => undefined };
+    }
+
+    let discarded = false;
+    const hadOwnDiscard = Object.prototype.hasOwnProperty.call(job, 'discard');
+
+    job.discard = function trackedDiscard(this: Job): void {
+      discarded = true;
+      return original.call(this);
+    };
+
+    return {
+      wasDiscarded: () => discarded,
+      restore: () => {
+        if (hadOwnDiscard) {
+          job.discard = original;
+        } else {
+          delete (job as Partial<Job>).discard;
+        }
+      },
+    };
+  }
+
+  /**
+   * Run a per-job hook without letting it affect job processing.
+   */
+  private async runJobHook(
+    name: string,
+    run: () => void | Promise<void>,
+  ): Promise<void> {
+    try {
+      await run();
+    } catch (error) {
+      this.logger.error(
+        `${name} hook threw: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 

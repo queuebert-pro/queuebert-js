@@ -328,6 +328,7 @@ export type QueuebertEndpoint =
   | 'resume' // POST /resume or /:queue/resume - resume queue(s)
   | 'clean' // POST /:queue/clean - remove old completed/failed jobs
   | 'drain' // POST /:queue/drain - remove all waiting jobs
+  | 'jobs' // GET /:queue/jobs - read-only job inspection (off by default)
   | 'migrations'; // GET/POST /migrations - migrate jobs between queues/redis instances
 
 /**
@@ -345,11 +346,20 @@ export const ALL_OPTIONAL_ENDPOINTS: OptionalQueuebertEndpoint[] = [
   'resume',
   'clean',
   'drain',
+  'jobs',
   'migrations',
 ];
 
 /**
- * Read-only optional endpoints (safe to expose publicly)
+ * Read-only optional endpoints (safe to expose publicly).
+ *
+ * This doubles as the default when `endpoints` is not configured, so anything
+ * added here is enabled for every existing consumer on upgrade.
+ *
+ * 'jobs' is deliberately excluded even though it is read-only: 'metrics'
+ * exposes aggregates, whereas 'jobs' exposes per-job identifiers, failure
+ * reasons and stack traces. Those are not the same risk class, so job
+ * inspection must be opted into explicitly.
  */
 export const READONLY_OPTIONAL_ENDPOINTS: OptionalQueuebertEndpoint[] = [
   'metrics',
@@ -367,6 +377,14 @@ export interface QueuebertCapabilities {
   canClean: boolean;
   /** Whether drain operation is available */
   canDrain: boolean;
+  /** Whether read-only job inspection is available */
+  canInspectJobs: boolean;
+  /**
+   * Whether job inspection responses include raw payloads (`data`) and handler
+   * return values. False means those fields are withheld, not that they are
+   * empty.
+   */
+  canInspectJobData: boolean;
   /** Whether migration operations are available */
   canMigrate: boolean;
   /** Whether cache migration operations are available */
@@ -569,6 +587,10 @@ export interface QueuebertModuleOptions {
    * endpoints: ['metrics']
    *
    * @example
+   * // Add read-only job inspection for debugging failed jobs
+   * endpoints: ['metrics', 'jobs']
+   *
+   * @example
    * // Full control except drain
    * endpoints: ['metrics', 'pause', 'resume', 'clean']
    */
@@ -614,13 +636,36 @@ export interface QueuebertModuleOptions {
   };
 
   /**
-   * Include raw BullMQ job payloads in migration preview sampleJobs.
+   * Include raw BullMQ job payloads (`data`) and handler return values
+   * (`returnvalue`) in job inspection responses and migration preview
+   * sampleJobs.
    *
    * Disabled by default because job data commonly contains sensitive
-   * application-specific values. Migration execution still copies original job
-   * data by reading each job directly from BullMQ.
+   * application-specific values. Migration execution is unaffected either way:
+   * it copies original job data by reading each job directly from BullMQ.
+   */
+  includeJobData?: boolean;
+
+  /**
+   * @deprecated Use `includeJobData`, which governs both job inspection and
+   * migration preview. Retained as an alias so existing configuration keeps
+   * working; `includeJobData` wins when both are set.
    */
   includeJobDataInMigrationPreview?: boolean;
+
+  /**
+   * Optional hook to scrub job info before it leaves the API.
+   *
+   * Runs on every job returned by the 'jobs' endpoint and by migration
+   * preview, after the `includeJobData` tier has been applied. Use it to run
+   * an application-specific scrubber over `failedReason`, `stacktrace` or an
+   * opted-in `data` payload.
+   *
+   * The hook must be synchronous and should not throw. If it does throw, the
+   * job is reduced to its identity fields (`id`, `name`, `state`) rather than
+   * being returned unscrubbed.
+   */
+  jobRedaction?: (info: JobInfo) => JobInfo;
 }
 
 /**
@@ -656,28 +701,152 @@ export interface RateSample {
 }
 
 /**
+ * Job states that can be listed through the job inspection endpoint.
+ *
+ * These map one-to-one onto BullMQ's own per-state getters. Note that BullMQ
+ * orders each state differently: 'completed' and 'failed' come back
+ * newest-first, every other state oldest-first. Pagination via start/end
+ * follows whatever order BullMQ uses for the requested state.
+ */
+export type InspectableJobState =
+  | 'waiting'
+  | 'waiting-children'
+  | 'active'
+  | 'delayed'
+  | 'prioritized'
+  | 'completed'
+  | 'failed';
+
+/**
+ * All states accepted by the job inspection endpoint
+ */
+export const INSPECTABLE_JOB_STATES: InspectableJobState[] = [
+  'waiting',
+  'waiting-children',
+  'active',
+  'delayed',
+  'prioritized',
+  'completed',
+  'failed',
+];
+
+/**
  * Job state for migration operations
  */
 export type MigrationJobState = 'waiting' | 'delayed' | 'failed';
 
 /**
- * Individual job info for migration preview
+ * A single job as reported by job inspection and migration preview.
+ *
+ * Privacy tiers:
+ * - Identity, timing and attempt fields are always present.
+ * - `failedReason` and `stacktrace` are present when BullMQ has them; enabling
+ *   the 'jobs' endpoint is itself the opt-in for those.
+ * - `data` and `returnvalue` are withheld unless `includeJobData` is set.
  */
-export interface MigrationJobInfo {
+export interface JobInfo {
   id: string;
   name: string;
   /**
-   * Job payload. Redacted from migration previews by default because job data
-   * often contains application PII or secrets.
+   * The state the job was read from. 'unknown' is only possible from the
+   * single-job route, where BullMQ reports the state it resolved.
+   */
+  state: InspectableJobState | 'unknown';
+  /** When the job was created (ms since epoch) */
+  timestamp?: number;
+  /** When the job was picked up by a worker (ms since epoch) */
+  processedOn?: number;
+  /** When the job completed or failed (ms since epoch) */
+  finishedOn?: number;
+  /**
+   * Attempts BullMQ has recorded as failed. During a failure this still holds
+   * the count *before* the current attempt; see `maxAttempts`.
+   */
+  attemptsMade?: number;
+  /** Configured attempt ceiling (`opts.attempts`), defaulting to 1 */
+  maxAttempts?: number;
+  /** Failure reason recorded by BullMQ */
+  failedReason?: string;
+  /** Stack traces recorded by BullMQ, one entry per failed attempt */
+  stacktrace?: string[];
+  /** Progress reported by the handler */
+  progress?: unknown;
+  /** Configured delay in ms */
+  delay?: number;
+  /**
+   * Job payload. Withheld unless `includeJobData` is set, because job data
+   * commonly contains application PII or secrets.
    */
   data?: unknown;
+  /**
+   * Handler return value. Withheld unless `includeJobData` is set, for the
+   * same reason as `data`.
+   */
+  returnvalue?: unknown;
+}
+
+/**
+ * Options for listing jobs from a queue
+ */
+export interface ListJobsOptions {
+  /** State to read from (default: 'failed') */
+  state?: InspectableJobState;
+  /**
+   * Only return jobs whose name matches. Applied *after* the start/end window
+   * is read from Redis, so it filters within the page rather than across the
+   * whole state.
+   */
+  jobType?: string;
+  /** Zero-based inclusive start index (default: 0) */
+  start?: number;
+  /** Zero-based inclusive end index, -1 for all (default: -1) */
+  end?: number;
+}
+
+/**
+ * Individual job info for migration preview
+ */
+export interface MigrationJobInfo extends JobInfo {
   state: MigrationJobState;
   /** For delayed jobs, the remaining delay in ms */
   remainingDelayMs?: number;
-  /** Number of attempts made (for failed jobs) */
-  attemptsMade?: number;
-  /** Failure reason (for failed jobs) */
-  failedReason?: string;
+}
+
+/**
+ * Paginated response for GET /:queue/jobs
+ */
+export interface JobListResult {
+  /** Queue this page was read from (the configured stats key) */
+  queue: string;
+  /** State the jobs were read from */
+  state: InspectableJobState;
+  jobs: JobInfo[];
+  /**
+   * Total jobs in this state for the queue. This counts the whole state and
+   * therefore ignores `jobType` — see `jobTypeFilter`.
+   */
+  total: number;
+  /** Zero-based inclusive start index of this page */
+  start: number;
+  /** Zero-based inclusive end index of this page */
+  end: number;
+  /**
+   * Set when a jobType filter was applied. While present, `jobs` has been
+   * filtered within this page only and `total` does not reflect the filter, so
+   * `jobs.length` can be smaller than the page size without the page being the
+   * last one.
+   */
+  jobTypeFilter?: string;
+  timestamp: string;
+}
+
+/**
+ * A single job response for GET /:queue/jobs/:jobId
+ */
+export interface JobDetailResult {
+  queue: string;
+  job: JobInfo;
+  timestamp: string;
 }
 
 /**

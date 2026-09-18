@@ -1,6 +1,6 @@
 import { Injectable, Inject, Logger, OnModuleDestroy } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import type { Queue } from 'bullmq';
+import type { Job, Queue } from 'bullmq';
 
 import type { QueuebertIntegrationRegistry } from './integration-registry';
 import {
@@ -32,6 +32,11 @@ import type {
   MigrationResult,
   MigrationJobInfo,
   MigrationJobState,
+  JobInfo,
+  JobListResult,
+  JobDetailResult,
+  ListJobsOptions,
+  InspectableJobState,
   MigrationStatus,
   MigrationStartResponse,
   MigrationCancelResponse,
@@ -140,6 +145,20 @@ export class QueuebertService implements OnModuleDestroy {
   }
 
   /**
+   * Whether raw job payloads may leave the API.
+   *
+   * `includeJobDataInMigrationPreview` is the deprecated alias; the newer
+   * `includeJobData` wins when both are set.
+   */
+  private get includeJobData(): boolean {
+    return (
+      this.options.includeJobData ??
+      this.options.includeJobDataInMigrationPreview ??
+      false
+    );
+  }
+
+  /**
    * Get the list of enabled endpoints
    */
   getEnabledEndpoints(): QueuebertEndpoint[] {
@@ -161,6 +180,9 @@ export class QueuebertService implements OnModuleDestroy {
         this.enabledEndpoints.has('resume'),
       canClean: this.enabledEndpoints.has('clean'),
       canDrain: this.enabledEndpoints.has('drain'),
+      canInspectJobs: this.enabledEndpoints.has('jobs'),
+      canInspectJobData:
+        this.enabledEndpoints.has('jobs') && this.includeJobData,
       canMigrate: migrationsEnabled,
       canMigrateCache: migrationsEnabled,
     };
@@ -1134,6 +1156,195 @@ export class QueuebertService implements OnModuleDestroy {
   }
 
   /**
+   * Read jobs from a queue by state.
+   *
+   * Returns job info verbatim, including `data` — privacy tiers are applied by
+   * `applyJobPrivacy()` at the point a job leaves the API, so that internal
+   * callers (migration) are unaffected by inspection settings.
+   *
+   * Ordering is BullMQ's and differs per state: 'completed' and 'failed' come
+   * back newest-first, everything else oldest-first.
+   */
+  async listJobs(
+    queue: Queue,
+    options: ListJobsOptions = {},
+  ): Promise<JobInfo[]> {
+    const state = options.state ?? 'failed';
+    const start = options.start ?? 0;
+    const end = options.end ?? -1;
+
+    const jobs = await this.readJobsByState(queue, state, start, end);
+
+    // NOTE: filtering by name happens after the start/end window has been read
+    // from Redis, so it narrows within a page rather than across the state.
+    const filteredJobs = options.jobType
+      ? jobs.filter((job) => job.name === options.jobType)
+      : jobs;
+
+    return filteredJobs.map((job) => this.toJobInfo(job, state));
+  }
+
+  /**
+   * Read a single job by id, resolving its current state.
+   *
+   * Unlike `listJobs()` this costs an extra Redis round-trip for `getState()`,
+   * which is why the list path reuses the state it queried by instead.
+   *
+   * Returns job info verbatim; use `getJobDetail()` for the tiered response
+   * the HTTP surface serves.
+   */
+  async getJobById(queue: Queue, jobId: string): Promise<JobInfo | null> {
+    const job = await queue.getJob(jobId);
+    if (!job) return null;
+
+    const state = await job.getState();
+    return this.toJobInfo(job, state);
+  }
+
+  /**
+   * Build a job inspection page, including the state total.
+   */
+  async getJobList(
+    queue: Queue,
+    queueName: string,
+    options: ListJobsOptions = {},
+  ): Promise<JobListResult> {
+    const state = options.state ?? 'failed';
+    const start = options.start ?? 0;
+    const end = options.end ?? -1;
+
+    const [jobs, total] = await Promise.all([
+      this.listJobs(queue, { ...options, state, start, end }),
+      queue.getJobCountByTypes(state),
+    ]);
+
+    return {
+      queue: queueName,
+      state,
+      jobs: jobs.map((job) => this.applyJobPrivacy(job)),
+      total,
+      start,
+      end,
+      ...(options.jobType ? { jobTypeFilter: options.jobType } : {}),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Build a single-job inspection response, or null when the job is gone.
+   */
+  async getJobDetail(
+    queue: Queue,
+    queueName: string,
+    jobId: string,
+  ): Promise<JobDetailResult | null> {
+    const job = await this.getJobById(queue, jobId);
+    if (!job) return null;
+
+    return {
+      queue: queueName,
+      job: this.applyJobPrivacy(job),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Map a BullMQ job onto the shared JobInfo shape.
+   */
+  private toJobInfo(job: Job, state: JobInfo['state']): JobInfo {
+    const info: JobInfo = {
+      id: job.id ?? 'unknown',
+      name: job.name,
+      state,
+      data: job.data,
+      timestamp: job.timestamp,
+      attemptsMade: job.attemptsMade,
+      maxAttempts: job.opts?.attempts ?? 1,
+    };
+
+    if (job.processedOn !== undefined) info.processedOn = job.processedOn;
+    if (job.finishedOn !== undefined) info.finishedOn = job.finishedOn;
+    if (job.delay) info.delay = job.delay;
+    if (job.failedReason) info.failedReason = job.failedReason;
+    // BullMQ types stacktrace as string[] | null.
+    if (job.stacktrace?.length) info.stacktrace = job.stacktrace;
+    // BullMQ initialises progress to 0, so 0 is treated as "not reported"
+    // rather than emitted for every job that never called updateProgress().
+    if (job.progress !== undefined && job.progress !== 0) {
+      info.progress = job.progress;
+    }
+    if (job.returnvalue !== undefined && job.returnvalue !== null) {
+      info.returnvalue = job.returnvalue;
+    }
+
+    return info;
+  }
+
+  /**
+   * Apply privacy tiers to a job before it leaves the API.
+   *
+   * `data` and `returnvalue` are withheld unless `includeJobData` is set. A
+   * configured `jobRedaction` hook then runs over what remains; if it throws,
+   * the job is reduced to its identity fields rather than returned unscrubbed.
+   */
+  private applyJobPrivacy<T extends JobInfo>(info: T): T {
+    const scrubbed: T = { ...info };
+
+    if (!this.includeJobData) {
+      delete scrubbed.data;
+      delete scrubbed.returnvalue;
+    }
+
+    const redact = this.options.jobRedaction;
+    if (!redact) return scrubbed;
+
+    try {
+      return redact(scrubbed) as T;
+    } catch (error) {
+      this.logger.error(
+        `jobRedaction hook threw for job ${info.id}; withholding job detail: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return { id: info.id, name: info.name, state: info.state } as T;
+    }
+  }
+
+  /**
+   * Read raw jobs for a state using BullMQ's per-state getters.
+   *
+   * Deliberately uses the individual getters rather than `queue.getJobs()`:
+   * each getter carries BullMQ's own sort direction for that state, and going
+   * through the generic call would silently reorder waiting/delayed reads that
+   * migration depends on.
+   */
+  private async readJobsByState(
+    queue: Queue,
+    state: InspectableJobState,
+    start: number,
+    end: number,
+  ): Promise<Job[]> {
+    switch (state) {
+      case 'waiting':
+        return queue.getWaiting(start, end);
+      case 'waiting-children':
+        return queue.getWaitingChildren(start, end);
+      case 'active':
+        return queue.getActive(start, end);
+      case 'delayed':
+        return queue.getDelayed(start, end);
+      case 'prioritized':
+        return queue.getPrioritized(start, end);
+      case 'completed':
+        return queue.getCompleted(start, end);
+      case 'failed':
+        return queue.getFailed(start, end);
+      default:
+        return [];
+    }
+  }
+
+  /**
    * Get jobs from a queue by state for migration
    */
   private async getJobsByState(
@@ -1142,34 +1353,17 @@ export class QueuebertService implements OnModuleDestroy {
     jobType?: string,
     limit?: number,
   ): Promise<MigrationJobInfo[]> {
-    let jobs: Awaited<ReturnType<Queue['getWaiting']>>;
+    if (limit !== undefined && limit <= 0) return [];
 
-    switch (state) {
-      case 'waiting':
-        jobs = await queue.getWaiting(0, limit ? limit - 1 : undefined);
-        break;
-      case 'delayed':
-        jobs = await queue.getDelayed(0, limit ? limit - 1 : undefined);
-        break;
-      case 'failed':
-        jobs = await queue.getFailed(0, limit ? limit - 1 : undefined);
-        break;
-      default:
-        jobs = [];
-    }
+    const jobs = await this.listJobs(queue, {
+      state,
+      jobType,
+      start: 0,
+      end: limit === undefined ? -1 : limit - 1,
+    });
 
-    // Filter by job type if specified
-    const filteredJobs = jobType
-      ? jobs.filter((job) => job.name === jobType)
-      : jobs;
-
-    return filteredJobs.map((job) => {
-      const info: MigrationJobInfo = {
-        id: job.id ?? 'unknown',
-        name: job.name,
-        data: job.data,
-        state,
-      };
+    return jobs.map((job) => {
+      const info: MigrationJobInfo = { ...job, state };
 
       if (state === 'delayed' && job.delay) {
         const processedOn = job.processedOn || Date.now();
@@ -1177,11 +1371,6 @@ export class QueuebertService implements OnModuleDestroy {
           0,
           job.delay - (Date.now() - processedOn),
         );
-      }
-
-      if (state === 'failed') {
-        info.attemptsMade = job.attemptsMade;
-        info.failedReason = job.failedReason ?? undefined;
       }
 
       return info;
@@ -1239,15 +1428,9 @@ export class QueuebertService implements OnModuleDestroy {
 
     // Apply total limit for sample jobs (limit to 50 for preview)
     const sampleLimit = Math.min(params.limit || 50, 50);
-    const sampleJobs = jobs.slice(0, sampleLimit).map((job) => {
-      if (this.options.includeJobDataInMigrationPreview) {
-        return job;
-      }
-
-      const redactedJob = { ...job };
-      delete redactedJob.data;
-      return redactedJob;
-    });
+    const sampleJobs = jobs
+      .slice(0, sampleLimit)
+      .map((job) => this.applyJobPrivacy(job));
 
     // Calculate estimated duration based on batch size and delay
     const batchSize = params.batchSize || 100;

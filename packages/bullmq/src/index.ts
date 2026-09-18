@@ -35,7 +35,11 @@ export {
 
 // Base processor class
 export { BaseQueueProcessor } from './lib/base-queue-processor';
-export type { BaseQueueProcessorOptions } from './lib/base-queue-processor';
+export type {
+  BaseQueueProcessorOptions,
+  JobFailureContext,
+  JobCompletionContext,
+} from './lib/base-queue-processor';
 
 // Adapter for @queuebert/nest integration
 export type { QueueContext } from './lib/queuebert-processor-adapter';
