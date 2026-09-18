@@ -183,6 +183,44 @@ Two behaviours worth knowing:
   response sets `jobTypeFilter` whenever this applies, and `total` always
   counts the whole state.
 
+### Failure retention
+
+Job inspection can only show you what BullMQ still has. `removeOnFail` decides
+that, and its two forms behave very differently when something goes wrong:
+
+```ts
+// Volume-based: keep the most recent 1000 failures
+await queue.add('send-email', data, { removeOnFail: { count: 1000 } });
+
+// Time-based: keep failures for 7 days (age is in SECONDS)
+await queue.add('send-email', data, {
+  removeOnFail: { age: 7 * 24 * 60 * 60 },
+});
+```
+
+Prefer `age` for anything you intend to debug later. With `count`, retention
+depends on failure volume, so a burst of 1001 failures evicts everything from
+before the burst — which is exactly the window you want during an incident,
+and exactly when the burst happens. A Sentry event, a `lastFailure` you saw a
+moment ago, or a job id from a log can all point at a job that has already
+been evicted, and `GET /:queueName/jobs/:jobId` then answers 404. With `age`,
+an incident cannot push earlier failures out of the window.
+
+Two caveats worth knowing:
+
+- **Eviction is best-effort, not scheduled.** BullMQ evaluates it when a job
+  transitions into the failed set; there is no background timer. On a quiet
+  queue, failures older than `age` stay until something else fails. That
+  favours debugging, but it means `age` is not a retention guarantee, so do
+  not rely on it to satisfy a data-retention policy.
+- **`age` and `count` together are an AND.** Jobs are kept only if they
+  satisfy both, so `count` acts as a hard ceiling. Combine them when you want
+  a memory bound, and set `count` high enough that it is not the binding
+  constraint in normal operation.
+
+If `removeOnFail` is unset, failed jobs are kept indefinitely — nothing is
+evicted, and the risk is unbounded growth rather than missing jobs.
+
 ## Job Controls
 
 `retry` and `remove` are mutating and gated separately from `jobs`, so

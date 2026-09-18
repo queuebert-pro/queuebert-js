@@ -178,6 +178,15 @@ QueuebertModule.forRoot({
 });
 ```
 
+### Failure retention
+
+When configuring `removeOnFail`, prefer the time-based form
+(`{ age: seconds }`) over the volume-based one (`{ count: n }`) for any queue
+whose failures you intend to debug later: with `count`, a burst of failures
+evicts everything from before the burst, so a job id from a Sentry event or a
+log can point at a job that is already gone. See "Failure retention" in the
+`@queuebert/nest` README for the full reasoning and caveats.
+
 ## QueuebertBullMQService
 
 Create Queuebert-wrapped queues and workers programmatically:
