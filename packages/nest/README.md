@@ -123,6 +123,8 @@ Supported optional endpoints are:
 - `clean`
 - `drain`
 - `jobs`
+- `retry`
+- `remove`
 - `migrations`
 
 `jobs` is read-only but is still off by default: unlike `metrics`, which
@@ -163,6 +165,50 @@ Two behaviours worth knowing:
   shorter than the requested page without that page being the last one. The
   response sets `jobTypeFilter` whenever this applies, and `total` always
   counts the whole state.
+
+## Job Controls
+
+`retry` and `remove` are mutating and gated separately from `jobs`, so
+read-only inspection can be enabled without handing out the controls:
+
+```ts
+QueuebertModule.forRoot({
+  queues: [{ name: 'emails', processor: EmailProcessor }],
+  endpoints: ['metrics', 'jobs', 'retry', 'remove'],
+});
+```
+
+| Route                                | Effect                                       |
+| ------------------------------------ | -------------------------------------------- |
+| `POST /:queueName/jobs/:jobId/retry` | Move one finished job back to wait           |
+| `POST /:queueName/jobs/retry`        | Move a bounded page of finished jobs to wait |
+| `DELETE /:queueName/jobs/:jobId`     | Remove one job                               |
+
+Single retry accepts `state` (`failed` by default, or `completed`) and
+`resetAttempts`. Without `resetAttempts`, the attempt counters are preserved,
+so a job that exhausted its attempts gets one further run rather than a fresh
+budget. A job in any other state returns `409`, naming the state it is
+actually in.
+
+Bulk retry accepts `state`, `jobType`, and `limit` (default 50, max 1000). It
+reports `retried`, `failed`, and details for the first few failures, so one
+locked job does not hide the rest of the work.
+
+Two things to know about bulk retry:
+
+- **`limit` is a real cap.** It is not BullMQ's `retryJobs({ count })`, where
+  `count` is a per-iteration batch size and the call drains the entire state.
+  Queuebert retries a bounded page job-by-job instead, which is what makes
+  `limit` and `jobType` possible at all.
+- **`jobType` filters within the page**, the same way it does when listing, and
+  the response sets `jobTypeFilter` whenever it applies.
+
+Removal returns `409` when BullMQ refuses, most commonly because a worker holds
+a lock on the job while processing it. An active job is not rejected up front,
+because BullMQ can remove an active job that is not locked.
+
+Note that `POST /:queueName/jobs/retry` shadows a job whose id is literally
+`retry`, in the same way the migration routes shadow `preview` and `start`.
 
 ## Auth
 

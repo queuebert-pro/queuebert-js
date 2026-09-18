@@ -329,6 +329,8 @@ export type QueuebertEndpoint =
   | 'clean' // POST /:queue/clean - remove old completed/failed jobs
   | 'drain' // POST /:queue/drain - remove all waiting jobs
   | 'jobs' // GET /:queue/jobs - read-only job inspection (off by default)
+  | 'retry' // POST /:queue/jobs/:id/retry - move failed/completed jobs back to wait
+  | 'remove' // DELETE /:queue/jobs/:id - remove a single job
   | 'migrations'; // GET/POST /migrations - migrate jobs between queues/redis instances
 
 /**
@@ -347,6 +349,8 @@ export const ALL_OPTIONAL_ENDPOINTS: OptionalQueuebertEndpoint[] = [
   'clean',
   'drain',
   'jobs',
+  'retry',
+  'remove',
   'migrations',
 ];
 
@@ -359,7 +363,8 @@ export const ALL_OPTIONAL_ENDPOINTS: OptionalQueuebertEndpoint[] = [
  * 'jobs' is deliberately excluded even though it is read-only: 'metrics'
  * exposes aggregates, whereas 'jobs' exposes per-job identifiers, failure
  * reasons and stack traces. Those are not the same risk class, so job
- * inspection must be opted into explicitly.
+ * inspection must be opted into explicitly. 'retry' and 'remove' mutate and so
+ * are excluded for the usual reason.
  */
 export const READONLY_OPTIONAL_ENDPOINTS: OptionalQueuebertEndpoint[] = [
   'metrics',
@@ -385,6 +390,10 @@ export interface QueuebertCapabilities {
    * empty.
    */
   canInspectJobData: boolean;
+  /** Whether failed/completed jobs can be moved back to wait */
+  canRetryJobs: boolean;
+  /** Whether individual jobs can be removed */
+  canRemoveJobs: boolean;
   /** Whether migration operations are available */
   canMigrate: boolean;
   /** Whether cache migration operations are available */
@@ -837,6 +846,102 @@ export interface JobListResult {
    * last one.
    */
   jobTypeFilter?: string;
+  timestamp: string;
+}
+
+/**
+ * States a job can be retried from. Mirrors BullMQ's `FinishedStatus`: only a
+ * job that has finished can be moved back to wait.
+ */
+export type RetryableJobState = 'failed' | 'completed';
+
+/**
+ * All states accepted by the retry endpoints
+ */
+export const RETRYABLE_JOB_STATES: RetryableJobState[] = [
+  'failed',
+  'completed',
+];
+
+/**
+ * Outcome of a single-job control action.
+ *
+ * Modelled as a discriminated union rather than thrown errors so the service
+ * stays free of HTTP concerns; the controller maps 'not-found' to 404 and
+ * 'conflict' to 409.
+ */
+export type JobControlOutcome<T> =
+  | { status: 'ok'; result: T }
+  | { status: 'not-found'; message: string }
+  | {
+      status: 'conflict';
+      message: string;
+      /** The job's state at the time of the attempt, when it was resolved */
+      state?: InspectableJobState | 'unknown';
+    };
+
+/**
+ * Result of POST /:queue/jobs/:jobId/retry
+ */
+export interface JobRetryResult {
+  queue: string;
+  jobId: string;
+  name: string;
+  /** State the job was moved back to wait from */
+  retriedFrom: RetryableJobState;
+  /**
+   * Attempts BullMQ had recorded before the retry. Unless `resetAttempts` was
+   * requested this is preserved, so a job that exhausted its attempts gets one
+   * further run rather than a fresh budget.
+   */
+  attemptsMade?: number;
+  /** Whether the attempt counters were reset as part of this retry */
+  resetAttempts: boolean;
+  timestamp: string;
+}
+
+/**
+ * A single job that could not be retried during a bulk retry
+ */
+export interface JobRetryFailure {
+  jobId: string;
+  name: string;
+  message: string;
+}
+
+/**
+ * Result of POST /:queue/jobs/retry
+ */
+export interface JobBulkRetryResult {
+  queue: string;
+  state: RetryableJobState;
+  /** The cap applied to this request */
+  limit: number;
+  /** How many jobs in the bounded page were eligible after filtering */
+  examined: number;
+  /** How many were moved back to wait */
+  retried: number;
+  /** How many could not be retried */
+  failed: number;
+  /** Details for the first few failures; `failed` is the full count */
+  failures: JobRetryFailure[];
+  /**
+   * Set when a jobType filter was applied. As with listing, the filter applies
+   * within the bounded page rather than across the whole state.
+   */
+  jobTypeFilter?: string;
+  timestamp: string;
+}
+
+/**
+ * Result of DELETE /:queue/jobs/:jobId
+ */
+export interface JobRemoveResult {
+  queue: string;
+  jobId: string;
+  name: string;
+  /** State the job was in when it was removed */
+  removedFrom: InspectableJobState | 'unknown';
   timestamp: string;
 }
 

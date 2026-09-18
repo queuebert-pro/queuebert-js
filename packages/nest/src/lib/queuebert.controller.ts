@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Query,
   Param,
   Inject,
@@ -17,6 +18,7 @@ import {
   QUEUEBERT_QUEUES,
   DEFAULT_REDIS_INSTANCE_ID,
   INSPECTABLE_JOB_STATES,
+  RETRYABLE_JOB_STATES,
 } from './types';
 import type {
   QueuebertModuleOptions,
@@ -25,6 +27,8 @@ import type {
   MigrationParams,
   MigrationJobState,
   InspectableJobState,
+  RetryableJobState,
+  JobControlOutcome,
   CacheMigrationParams,
 } from './types';
 
@@ -36,6 +40,8 @@ const VALID_MIGRATION_STATES: MigrationJobState[] = [
 const MAX_MIGRATION_LIMIT = 100_000;
 const DEFAULT_JOBS_PAGE_SIZE = 50;
 const MAX_JOBS_PAGE_SIZE = 100;
+const DEFAULT_BULK_RETRY_LIMIT = 50;
+const MAX_BULK_RETRY_LIMIT = 1_000;
 const MAX_MIGRATION_BATCH_SIZE = 5_000;
 const MAX_MIGRATION_DELAY_MS = 60_000;
 
@@ -121,6 +127,48 @@ function parseInspectableJobState(
   return state as InspectableJobState;
 }
 
+function parseRetryableJobState(value: string | undefined): RetryableJobState {
+  if (value === undefined || value.trim() === '') return 'failed';
+
+  const state = value.trim();
+  if (!RETRYABLE_JOB_STATES.includes(state as RetryableJobState)) {
+    throw new HttpException(
+      `state must be one of: ${RETRYABLE_JOB_STATES.join(', ')}`,
+      HttpStatus.BAD_REQUEST,
+    );
+  }
+
+  return state as RetryableJobState;
+}
+
+function parseBooleanFlag(
+  value: string | undefined,
+  name: string,
+): boolean | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+
+  const flag = value.trim().toLowerCase();
+  if (flag === 'true' || flag === '1') return true;
+  if (flag === 'false' || flag === '0') return false;
+
+  throw new HttpException(
+    `${name} must be true or false`,
+    HttpStatus.BAD_REQUEST,
+  );
+}
+
+/**
+ * Unwrap a job control outcome, mapping the failure cases onto HTTP.
+ */
+function unwrapJobOutcome<T>(outcome: JobControlOutcome<T>): T {
+  if (outcome.status === 'ok') return outcome.result;
+
+  throw new HttpException(
+    outcome.message,
+    outcome.status === 'not-found' ? HttpStatus.NOT_FOUND : HttpStatus.CONFLICT,
+  );
+}
+
 /**
  * Interface for the public methods of QueuebertController
  * This allows us to define an explicit return type for the factory function
@@ -147,6 +195,19 @@ export interface IQueuebertController {
     end?: string,
   ): Promise<unknown>;
   getQueueJob(queueName: string, jobId: string): Promise<unknown>;
+  retryQueueJobs(
+    queueName: string,
+    state?: string,
+    jobType?: string,
+    limit?: string,
+  ): Promise<unknown>;
+  retryQueueJob(
+    queueName: string,
+    jobId: string,
+    state?: string,
+    resetAttempts?: string,
+  ): Promise<unknown>;
+  removeQueueJob(queueName: string, jobId: string): Promise<unknown>;
   getMigrationQueues(): Promise<unknown>;
   listMigrations(): Promise<unknown>;
   previewMigration(
@@ -530,6 +591,80 @@ export function createQueuebertController(
       }
 
       return detail;
+    }
+
+    /**
+     * POST /:queueName/jobs/retry
+     * Move a bounded page of failed (or completed) jobs back to wait.
+     *
+     * `limit` is a real cap on how many jobs are retried, unlike BullMQ's own
+     * `retryJobs({ count })`, where count is a per-iteration batch size and
+     * the call drains the entire state.
+     *
+     * NOTE: this shadows a job whose id is literally 'retry'. That matches how
+     * the migration routes already treat 'preview'/'start'/'execute'.
+     */
+    @Post(':queueName/jobs/retry')
+    async retryQueueJobs(
+      @Param('queueName') queueName: string,
+      @Query('state') state?: string,
+      @Query('jobType') jobType?: string,
+      @Query('limit') limit?: string,
+    ) {
+      this.requireEndpoint('retry');
+      const { queue } = this.getQueueByName(queueName);
+
+      return this._queuebertService.retryJobsByState(queue, queueName, {
+        state: parseRetryableJobState(state),
+        jobType: jobType?.trim() || undefined,
+        limit:
+          parsePositiveInteger(limit, 'limit', MAX_BULK_RETRY_LIMIT) ??
+          DEFAULT_BULK_RETRY_LIMIT,
+      });
+    }
+
+    /**
+     * POST /:queueName/jobs/:jobId/retry
+     * Move one failed (or completed) job back to wait.
+     *
+     * Returns 409 when the job is in a state it cannot be retried from.
+     */
+    @Post(':queueName/jobs/:jobId/retry')
+    async retryQueueJob(
+      @Param('queueName') queueName: string,
+      @Param('jobId') jobId: string,
+      @Query('state') state?: string,
+      @Query('resetAttempts') resetAttempts?: string,
+    ) {
+      this.requireEndpoint('retry');
+      const { queue } = this.getQueueByName(queueName);
+
+      return unwrapJobOutcome(
+        await this._queuebertService.retryJob(queue, queueName, jobId, {
+          state: parseRetryableJobState(state),
+          resetAttempts: parseBooleanFlag(resetAttempts, 'resetAttempts'),
+        }),
+      );
+    }
+
+    /**
+     * DELETE /:queueName/jobs/:jobId
+     * Remove a single job.
+     *
+     * Returns 409 when BullMQ refuses the removal, most commonly because the
+     * job is locked by a worker that is processing it.
+     */
+    @Delete(':queueName/jobs/:jobId')
+    async removeQueueJob(
+      @Param('queueName') queueName: string,
+      @Param('jobId') jobId: string,
+    ) {
+      this.requireEndpoint('remove');
+      const { queue } = this.getQueueByName(queueName);
+
+      return unwrapJobOutcome(
+        await this._queuebertService.removeJob(queue, queueName, jobId),
+      );
     }
 
     /**

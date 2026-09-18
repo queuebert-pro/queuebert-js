@@ -7,6 +7,7 @@ import {
   QUEUEBERT_OPTIONS,
   QUEUEBERT_INTEGRATION_REGISTRY,
   READONLY_OPTIONAL_ENDPOINTS,
+  RETRYABLE_JOB_STATES,
   DEFAULT_REDIS_INSTANCE_ID,
   DEFAULT_REDIS_INSTANCE_LABEL,
 } from './types';
@@ -37,6 +38,12 @@ import type {
   JobDetailResult,
   ListJobsOptions,
   InspectableJobState,
+  RetryableJobState,
+  JobControlOutcome,
+  JobRetryResult,
+  JobRemoveResult,
+  JobBulkRetryResult,
+  JobRetryFailure,
   MigrationStatus,
   MigrationStartResponse,
   MigrationCancelResponse,
@@ -183,6 +190,8 @@ export class QueuebertService implements OnModuleDestroy {
       canInspectJobs: this.enabledEndpoints.has('jobs'),
       canInspectJobData:
         this.enabledEndpoints.has('jobs') && this.includeJobData,
+      canRetryJobs: this.enabledEndpoints.has('retry'),
+      canRemoveJobs: this.enabledEndpoints.has('remove'),
       canMigrate: migrationsEnabled,
       canMigrateCache: migrationsEnabled,
     };
@@ -1246,6 +1255,200 @@ export class QueuebertService implements OnModuleDestroy {
       job: this.applyJobPrivacy(job),
       timestamp: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Move a single failed or completed job back to wait.
+   */
+  async retryJob(
+    queue: Queue,
+    queueName: string,
+    jobId: string,
+    options: { state?: RetryableJobState; resetAttempts?: boolean } = {},
+  ): Promise<JobControlOutcome<JobRetryResult>> {
+    const requestedState = options.state ?? 'failed';
+
+    const job = await queue.getJob(jobId);
+    if (!job) {
+      return {
+        status: 'not-found',
+        message: `Job '${jobId}' not found in queue '${queueName}'`,
+      };
+    }
+
+    // Check the state up front so the caller gets the actual state named,
+    // rather than BullMQ's generic "not in the failed state" message.
+    const state = await job.getState();
+    if (state !== requestedState) {
+      return {
+        status: 'conflict',
+        state,
+        message: RETRYABLE_JOB_STATES.includes(state as RetryableJobState)
+          ? `Job '${jobId}' is in the '${state}' state, not '${requestedState}'. Retry it with state=${state}.`
+          : `Job '${jobId}' is in the '${state}' state and cannot be retried. Only failed or completed jobs can be retried.`,
+      };
+    }
+
+    const attemptsMade = job.attemptsMade;
+    try {
+      await job.retry(
+        requestedState,
+        options.resetAttempts
+          ? { resetAttemptsMade: true, resetAttemptsStarted: true }
+          : {},
+      );
+    } catch (error) {
+      const conflict = this.asJobConflict(error, state);
+      if (conflict) return conflict;
+      throw error;
+    }
+
+    return {
+      status: 'ok',
+      result: {
+        queue: queueName,
+        jobId,
+        name: job.name,
+        retriedFrom: requestedState,
+        attemptsMade: options.resetAttempts ? 0 : attemptsMade,
+        resetAttempts: options.resetAttempts ?? false,
+        timestamp: new Date().toISOString(),
+      },
+    };
+  }
+
+  /**
+   * Move a bounded page of failed or completed jobs back to wait.
+   *
+   * Deliberately does not use `queue.retryJobs()`. BullMQ's `count` option
+   * there is a per-iteration batch size and the call loops until the whole
+   * state is drained, so it can honour neither a cap nor a jobType filter.
+   * Retrying a bounded page job-by-job keeps `limit` meaningful and lets the
+   * response report which jobs failed to move.
+   */
+  async retryJobsByState(
+    queue: Queue,
+    queueName: string,
+    options: {
+      state?: RetryableJobState;
+      jobType?: string;
+      limit: number;
+      maxReportedFailures?: number;
+    },
+  ): Promise<JobBulkRetryResult> {
+    const state = options.state ?? 'failed';
+    const { limit } = options;
+    const maxReportedFailures = options.maxReportedFailures ?? 20;
+
+    // The page is read up front, so retrying jobs out of the state as we go
+    // cannot shift the window underneath us.
+    const jobs = await this.readJobsByState(queue, state, 0, limit - 1);
+    const targets = options.jobType
+      ? jobs.filter((job) => job.name === options.jobType)
+      : jobs;
+
+    let retried = 0;
+    let failed = 0;
+    const failures: JobRetryFailure[] = [];
+
+    for (const job of targets) {
+      try {
+        await job.retry(state);
+        retried++;
+      } catch (error) {
+        failed++;
+        if (failures.length < maxReportedFailures) {
+          failures.push({
+            jobId: job.id ?? 'unknown',
+            name: job.name,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    if (failed > 0) {
+      this.logger.warn(
+        `Bulk retry on '${queueName}' (${state}): ${retried} retried, ${failed} failed`,
+      );
+    }
+
+    return {
+      queue: queueName,
+      state,
+      limit,
+      examined: targets.length,
+      retried,
+      failed,
+      failures,
+      ...(options.jobType ? { jobTypeFilter: options.jobType } : {}),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Remove a single job from a queue.
+   *
+   * An active job is not rejected up front: BullMQ can remove an active job
+   * that no worker holds a lock on, so the attempt is left to decide.
+   */
+  async removeJob(
+    queue: Queue,
+    queueName: string,
+    jobId: string,
+  ): Promise<JobControlOutcome<JobRemoveResult>> {
+    const job = await queue.getJob(jobId);
+    if (!job) {
+      return {
+        status: 'not-found',
+        message: `Job '${jobId}' not found in queue '${queueName}'`,
+      };
+    }
+
+    const name = job.name;
+    const state = await job.getState();
+
+    try {
+      await job.remove();
+    } catch (error) {
+      const conflict = this.asJobConflict(error, state);
+      if (conflict) return conflict;
+      throw error;
+    }
+
+    return {
+      status: 'ok',
+      result: {
+        queue: queueName,
+        jobId,
+        name,
+        removedFrom: state,
+        timestamp: new Date().toISOString(),
+      },
+    };
+  }
+
+  /**
+   * Recognise the failures BullMQ reports when a job cannot be acted on.
+   *
+   * BullMQ raises these as plain `Error`s with formatted messages rather than
+   * typed classes, so there is nothing to match on but the phrasing. Anything
+   * unrecognised is left for the caller to rethrow rather than being reported
+   * as a conflict.
+   */
+  private asJobConflict(
+    error: unknown,
+    state: InspectableJobState | 'unknown',
+  ): { status: 'conflict'; message: string; state: typeof state } | null {
+    const message = error instanceof Error ? error.message : String(error);
+    const isConflict =
+      /is not in the .* state/i.test(message) ||
+      /locked by another worker/i.test(message) ||
+      /missing (key|lock) for job/i.test(message) ||
+      /pending dependencies/i.test(message) ||
+      /belongs to a job scheduler/i.test(message);
+
+    return isConflict ? { status: 'conflict', message, state } : null;
   }
 
   /**

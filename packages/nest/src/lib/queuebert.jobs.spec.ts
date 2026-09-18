@@ -15,9 +15,12 @@ import {
   ALL_OPTIONAL_ENDPOINTS,
 } from './types';
 import type {
+  JobBulkRetryResult,
   JobDetailResult,
   JobInfo,
   JobListResult,
+  JobRemoveResult,
+  JobRetryResult,
   QueuebertModuleOptions,
 } from './types';
 
@@ -42,6 +45,8 @@ describe('job inspection', () => {
       returnvalue: { receipt: 'abc' },
       delay: 0,
       getState: jest.fn().mockResolvedValue('failed'),
+      retry: jest.fn().mockResolvedValue(undefined),
+      remove: jest.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -510,6 +515,500 @@ describe('job inspection', () => {
 
       // listJobs is the internal reader; tiers are applied on the way out.
       expect(jobs[0]).toHaveProperty('data');
+    });
+  });
+
+  describe('retry and remove', () => {
+    it('keeps both mutating endpoints out of the default set', () => {
+      expect(READONLY_OPTIONAL_ENDPOINTS).not.toContain('retry');
+      expect(READONLY_OPTIONAL_ENDPOINTS).not.toContain('remove');
+      expect(ALL_OPTIONAL_ENDPOINTS).toContain('retry');
+      expect(ALL_OPTIONAL_ENDPOINTS).toContain('remove');
+    });
+
+    it('reports the control capabilities independently', () => {
+      expect(createService().getCapabilities()).toMatchObject({
+        canRetryJobs: false,
+        canRemoveJobs: false,
+      });
+      expect(
+        createService({ endpoints: ['retry'] }).getCapabilities(),
+      ).toMatchObject({ canRetryJobs: true, canRemoveJobs: false });
+      expect(
+        createService({ endpoints: ['remove'] }).getCapabilities(),
+      ).toMatchObject({ canRetryJobs: false, canRemoveJobs: true });
+    });
+
+    it('404s the control routes when not enabled', async () => {
+      // Enabling read-only inspection must not imply the mutating routes.
+      const controller = await createController({ endpoints: ['jobs'] });
+
+      await expect(
+        controller.retryQueueJob('emails', 'j1'),
+      ).rejects.toMatchObject({ status: HttpStatus.NOT_FOUND });
+      await expect(controller.retryQueueJobs('emails')).rejects.toMatchObject({
+        status: HttpStatus.NOT_FOUND,
+      });
+      await expect(
+        controller.removeQueueJob('emails', 'j1'),
+      ).rejects.toMatchObject({ status: HttpStatus.NOT_FOUND });
+    });
+
+    describe('single retry', () => {
+      it('retries a failed job and preserves its attempt count', async () => {
+        const job = createJob();
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJob(
+          'emails',
+          'j1',
+        )) as JobRetryResult;
+
+        expect(job.retry).toHaveBeenCalledWith('failed', {});
+        expect(result).toMatchObject({
+          queue: 'emails',
+          jobId: 'j1',
+          name: 'send-email',
+          retriedFrom: 'failed',
+          attemptsMade: 2,
+          resetAttempts: false,
+        });
+      });
+
+      it('resets both attempt counters when asked', async () => {
+        const job = createJob();
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJob(
+          'emails',
+          'j1',
+          'failed',
+          'true',
+        )) as JobRetryResult;
+
+        expect(job.retry).toHaveBeenCalledWith('failed', {
+          resetAttemptsMade: true,
+          resetAttemptsStarted: true,
+        });
+        expect(result).toMatchObject({ resetAttempts: true, attemptsMade: 0 });
+      });
+
+      it('retries a completed job when that state is requested', async () => {
+        const job = createJob({
+          getState: jest.fn().mockResolvedValue('completed'),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJob(
+          'emails',
+          'j1',
+          'completed',
+        )) as JobRetryResult;
+
+        expect(job.retry).toHaveBeenCalledWith('completed', {});
+        expect(result.retriedFrom).toBe('completed');
+      });
+
+      it('409s with a usable hint when the job is in the other finished state', async () => {
+        const job = createJob({
+          getState: jest.fn().mockResolvedValue('completed'),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        await expect(
+          controller.retryQueueJob('emails', 'j1'),
+        ).rejects.toMatchObject({
+          status: HttpStatus.CONFLICT,
+          message: expect.stringContaining('state=completed'),
+        });
+        expect(job.retry).not.toHaveBeenCalled();
+      });
+
+      it('409s for a job that has not finished', async () => {
+        const job = createJob({
+          getState: jest.fn().mockResolvedValue('active'),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        await expect(
+          controller.retryQueueJob('emails', 'j1'),
+        ).rejects.toMatchObject({
+          status: HttpStatus.CONFLICT,
+          message: expect.stringContaining('cannot be retried'),
+        });
+        expect(job.retry).not.toHaveBeenCalled();
+      });
+
+      it('404s a job that is gone', async () => {
+        const queue = createQueue({
+          getJob: jest.fn().mockResolvedValue(undefined),
+        });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        await expect(
+          controller.retryQueueJob('emails', 'nope'),
+        ).rejects.toMatchObject({ status: HttpStatus.NOT_FOUND });
+      });
+
+      it('rejects an unsupported retry state', async () => {
+        const controller = await createController({ endpoints: ['retry'] });
+
+        await expect(
+          controller.retryQueueJob('emails', 'j1', 'waiting'),
+        ).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+      });
+
+      it('rejects a non-boolean resetAttempts', async () => {
+        const controller = await createController({ endpoints: ['retry'] });
+
+        await expect(
+          controller.retryQueueJob('emails', 'j1', 'failed', 'yes'),
+        ).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+      });
+
+      it('maps a lost race with another retry onto 409', async () => {
+        const job = createJob({
+          retry: jest
+            .fn()
+            .mockRejectedValue(
+              new Error('Job j1 is not in the failed state. reprocessJob'),
+            ),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        await expect(
+          controller.retryQueueJob('emails', 'j1'),
+        ).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+      });
+
+      it('does not disguise an unexpected error as a conflict', async () => {
+        const job = createJob({
+          retry: jest.fn().mockRejectedValue(new Error('ECONNRESET')),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const error = await controller
+          .retryQueueJob('emails', 'j1')
+          .catch((err: unknown) => err);
+
+        // A 409 built from this error would carry the same message, so the
+        // assertion has to be that it was not mapped at all.
+        expect(error).not.toBeInstanceOf(HttpException);
+        expect((error as Error).message).toBe('ECONNRESET');
+      });
+    });
+
+    describe('bulk retry', () => {
+      it('retries the bounded page and reports counts', async () => {
+        const jobs = [createJob({ id: 'a' }), createJob({ id: 'b' })];
+        const queue = createQueue({
+          getFailed: jest.fn().mockResolvedValue(jobs),
+        });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJobs(
+          'emails',
+        )) as JobBulkRetryResult;
+
+        expect(queue.getFailed).toHaveBeenCalledWith(0, 49);
+        expect(jobs[0].retry).toHaveBeenCalledWith('failed');
+        expect(jobs[1].retry).toHaveBeenCalledWith('failed');
+        expect(result).toMatchObject({
+          queue: 'emails',
+          state: 'failed',
+          limit: 50,
+          examined: 2,
+          retried: 2,
+          failed: 0,
+          failures: [],
+        });
+      });
+
+      it('treats limit as a real cap on jobs read', async () => {
+        const queue = createQueue();
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJobs(
+          'emails',
+          'failed',
+          undefined,
+          '10',
+        )) as JobBulkRetryResult;
+
+        // A cap, unlike BullMQ's retryJobs({ count }) batch size.
+        expect(queue.getFailed).toHaveBeenCalledWith(0, 9);
+        expect(result.limit).toBe(10);
+      });
+
+      it('rejects a limit above the cap', async () => {
+        const controller = await createController({ endpoints: ['retry'] });
+
+        await expect(
+          controller.retryQueueJobs('emails', 'failed', undefined, '1001'),
+        ).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+      });
+
+      it('filters by jobType and flags that it applies within the page', async () => {
+        const wanted = createJob({ id: 'a', name: 'sync' });
+        const other = createJob({ id: 'b', name: 'other' });
+        const queue = createQueue({
+          getFailed: jest.fn().mockResolvedValue([wanted, other]),
+        });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJobs(
+          'emails',
+          'failed',
+          'sync',
+        )) as JobBulkRetryResult;
+
+        expect(wanted.retry).toHaveBeenCalled();
+        expect(other.retry).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          examined: 1,
+          retried: 1,
+          jobTypeFilter: 'sync',
+        });
+      });
+
+      it('keeps going past a failure and reports it', async () => {
+        const good = createJob({ id: 'a' });
+        const bad = createJob({
+          id: 'b',
+          retry: jest.fn().mockRejectedValue(new Error('locked')),
+        });
+        const queue = createQueue({
+          getFailed: jest.fn().mockResolvedValue([bad, good]),
+        });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+        jest
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation(() => undefined);
+
+        const result = (await controller.retryQueueJobs(
+          'emails',
+        )) as JobBulkRetryResult;
+
+        expect(good.retry).toHaveBeenCalled();
+        expect(result).toMatchObject({
+          examined: 2,
+          retried: 1,
+          failed: 1,
+        });
+        expect(result.failures).toEqual([
+          { jobId: 'b', name: 'send-email', message: 'locked' },
+        ]);
+      });
+
+      it('caps how many failure details it returns', async () => {
+        const service = createService({ endpoints: ['retry'] });
+        const failing = Array.from({ length: 5 }, (_, i) =>
+          createJob({
+            id: `j${i}`,
+            retry: jest.fn().mockRejectedValue(new Error('locked')),
+          }),
+        );
+        const queue = createQueue({
+          getFailed: jest.fn().mockResolvedValue(failing),
+        });
+        jest
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation(() => undefined);
+
+        const result = await service.retryJobsByState(
+          queue as never,
+          'emails',
+          { limit: 10, maxReportedFailures: 2 },
+        );
+
+        expect(result.failed).toBe(5);
+        expect(result.failures).toHaveLength(2);
+      });
+
+      it('retries completed jobs when that state is requested', async () => {
+        const job = createJob({ id: 'c1' });
+        const queue = createQueue({
+          getCompleted: jest.fn().mockResolvedValue([job]),
+        });
+        const controller = await createController(
+          { endpoints: ['retry'] },
+          queue,
+        );
+
+        const result = (await controller.retryQueueJobs(
+          'emails',
+          'completed',
+        )) as JobBulkRetryResult;
+
+        expect(queue.getCompleted).toHaveBeenCalledWith(0, 49);
+        expect(job.retry).toHaveBeenCalledWith('completed');
+        expect(result.state).toBe('completed');
+      });
+    });
+
+    describe('remove', () => {
+      it('removes a job and reports the state it was in', async () => {
+        const job = createJob();
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['remove'] },
+          queue,
+        );
+
+        const result = (await controller.removeQueueJob(
+          'emails',
+          'j1',
+        )) as JobRemoveResult;
+
+        expect(job.remove).toHaveBeenCalled();
+        expect(result).toMatchObject({
+          queue: 'emails',
+          jobId: 'j1',
+          name: 'send-email',
+          removedFrom: 'failed',
+        });
+      });
+
+      it('attempts removal of an active job rather than pre-rejecting it', async () => {
+        // BullMQ can remove an active job that no worker holds a lock on.
+        const job = createJob({
+          getState: jest.fn().mockResolvedValue('active'),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['remove'] },
+          queue,
+        );
+
+        const result = (await controller.removeQueueJob(
+          'emails',
+          'j1',
+        )) as JobRemoveResult;
+
+        expect(job.remove).toHaveBeenCalled();
+        expect(result.removedFrom).toBe('active');
+      });
+
+      it('409s when the job is locked by a worker', async () => {
+        const job = createJob({
+          getState: jest.fn().mockResolvedValue('active'),
+          remove: jest
+            .fn()
+            .mockRejectedValue(
+              new Error(
+                'Job j1 could not be removed because it is locked by another worker',
+              ),
+            ),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['remove'] },
+          queue,
+        );
+
+        await expect(
+          controller.removeQueueJob('emails', 'j1'),
+        ).rejects.toMatchObject({
+          status: HttpStatus.CONFLICT,
+          message: expect.stringContaining('locked by another worker'),
+        });
+      });
+
+      it('409s when the job belongs to a job scheduler', async () => {
+        const job = createJob({
+          remove: jest
+            .fn()
+            .mockRejectedValue(
+              new Error(
+                'Job j1 belongs to a job scheduler and cannot be removed directly. removeJob',
+              ),
+            ),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['remove'] },
+          queue,
+        );
+
+        await expect(
+          controller.removeQueueJob('emails', 'j1'),
+        ).rejects.toMatchObject({ status: HttpStatus.CONFLICT });
+      });
+
+      it('404s a job that is gone', async () => {
+        const queue = createQueue({
+          getJob: jest.fn().mockResolvedValue(undefined),
+        });
+        const controller = await createController(
+          { endpoints: ['remove'] },
+          queue,
+        );
+
+        await expect(
+          controller.removeQueueJob('emails', 'nope'),
+        ).rejects.toMatchObject({ status: HttpStatus.NOT_FOUND });
+      });
+
+      it('does not disguise an unexpected error as a conflict', async () => {
+        const job = createJob({
+          remove: jest.fn().mockRejectedValue(new Error('ECONNRESET')),
+        });
+        const queue = createQueue({ getJob: jest.fn().mockResolvedValue(job) });
+        const controller = await createController(
+          { endpoints: ['remove'] },
+          queue,
+        );
+
+        const error = await controller
+          .removeQueueJob('emails', 'j1')
+          .catch((err: unknown) => err);
+
+        expect(error).not.toBeInstanceOf(HttpException);
+        expect((error as Error).message).toBe('ECONNRESET');
+      });
     });
   });
 });
