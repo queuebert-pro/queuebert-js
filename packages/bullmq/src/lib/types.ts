@@ -8,7 +8,12 @@ import type {
 } from 'bullmq';
 
 /**
- * Job lifecycle events emitted by QueuebertWorker
+ * Job lifecycle events emitted by QueuebertWorker.
+ *
+ * Note that 'job:failed' fires for every failed attempt, and 'job:retrying'
+ * fires additionally when BullMQ will try the job again. A listener that only
+ * wants genuine failures should filter on `isFinalAttempt` rather than
+ * assuming 'job:failed' means the job is finished.
  */
 export type JobLifecycleEvent =
   | 'job:started'
@@ -34,6 +39,26 @@ export interface JobLifecycleEventData<T = unknown, R = unknown> {
   attemptsMade?: number;
   delay?: number;
   duration?: number;
+  /**
+   * 1-based number of the attempt this event concerns. Present on
+   * 'job:failed' and 'job:retrying'.
+   *
+   * BullMQ does not increment `attemptsMade` until a job is moved to failed,
+   * so this is `attemptsMade + 1` and matches what BullMQ compares against
+   * `opts.attempts`.
+   */
+  attempt?: number;
+  /** Configured attempt ceiling (`opts.attempts`), defaulting to 1 */
+  maxAttempts?: number;
+  /**
+   * Whether BullMQ will decline to retry the job. Present on 'job:failed' and
+   * always false on 'job:retrying'.
+   *
+   * Covers the attempt ceiling, `job.discard()`, and `UnrecoverableError`. A
+   * custom `backoffStrategy` returning -1 also stops retries and cannot be
+   * detected here, so treat this as a lower bound if you use one.
+   */
+  isFinalAttempt?: boolean;
 }
 
 /**

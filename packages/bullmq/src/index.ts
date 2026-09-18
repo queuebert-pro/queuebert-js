@@ -33,6 +33,14 @@ export {
   GlobalStatsCollector,
 } from './lib/stats-collector';
 
+// Retry lifecycle helpers
+export {
+  isUnrecoverableError,
+  resolveRetryOutcome,
+  trackDiscard,
+} from './lib/retry-outcome';
+export type { RetryOutcome } from './lib/retry-outcome';
+
 // Base processor class
 export { BaseQueueProcessor } from './lib/base-queue-processor';
 export type {

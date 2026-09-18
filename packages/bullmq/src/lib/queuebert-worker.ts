@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { Worker, Job, Processor } from 'bullmq';
 
+import { resolveRetryOutcome, trackDiscard } from './retry-outcome';
 import { DurationStatsCollector } from './stats-collector';
 import type {
   QueuebertWorkerOptions,
@@ -205,6 +206,9 @@ export class QueuebertWorker<
       this.jobStartTimes.set(jobId, startTime);
       this.activeJobCount++;
 
+      // BullMQ keeps the discard flag protected, so observe the call instead.
+      const discardTracker = trackDiscard(job);
+
       // Emit started event
       await this.emit('job:started', {
         event: 'job:started',
@@ -272,7 +276,16 @@ export class QueuebertWorker<
         };
         this.statsCollector.record(record);
 
-        // Emit failed event
+        const outcome = resolveRetryOutcome(
+          job,
+          error,
+          discardTracker.wasDiscarded(),
+        );
+        const normalizedError =
+          error instanceof Error ? error : new Error(String(error));
+
+        // Emit failed event for every failed attempt, carrying where the
+        // attempt sits in the retry lifecycle.
         await this.emit('job:failed', {
           event: 'job:failed',
           jobId,
@@ -280,12 +293,37 @@ export class QueuebertWorker<
           queueName: this._queueName,
           timestamp: new Date(),
           data: job.data,
-          error: error instanceof Error ? error : new Error(String(error)),
+          error: normalizedError,
           duration,
           attemptsMade: job.attemptsMade,
+          attempt: outcome.attempt,
+          maxAttempts: outcome.maxAttempts,
+          isFinalAttempt: outcome.isFinalAttempt,
         });
 
+        // And a distinct event when another attempt is coming, so listeners
+        // can tell a transient failure from a terminal one without repeating
+        // BullMQ's retry arithmetic.
+        if (!outcome.isFinalAttempt) {
+          await this.emit('job:retrying', {
+            event: 'job:retrying',
+            jobId,
+            jobName,
+            queueName: this._queueName,
+            timestamp: new Date(),
+            data: job.data,
+            error: normalizedError,
+            duration,
+            attemptsMade: job.attemptsMade,
+            attempt: outcome.attempt,
+            maxAttempts: outcome.maxAttempts,
+            isFinalAttempt: false,
+          });
+        }
+
         throw error;
+      } finally {
+        discardTracker.restore();
       }
     };
   }

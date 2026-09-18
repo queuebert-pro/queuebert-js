@@ -156,6 +156,23 @@ Query parameters on the list route:
   and may span at most 100.
 - `jobType` — narrow to jobs with a given name.
 
+Enabling `jobs` also adds `lastFailure` to each queue's stats, so a dashboard
+can show what failed most recently without a second request:
+
+```json
+{
+  "jobId": "12345",
+  "name": "send-email",
+  "failedReason": "SMTP timeout",
+  "finishedOn": 1758158460000
+}
+```
+
+It is `null` when a queue has no failures, and omitted entirely when `jobs` is
+disabled — `stats` cannot be turned off, and a failure reason is the same risk
+class as the inspection endpoint. It costs one Redis round-trip per queue, and
+nothing at all for a queue whose failed count is already zero.
+
 Two behaviours worth knowing:
 
 - **Ordering is BullMQ's and varies by state.** `completed` and `failed` come

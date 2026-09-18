@@ -1011,4 +1011,92 @@ describe('job inspection', () => {
       });
     });
   });
+
+  describe('lastFailure on queue stats', () => {
+    function statsQueue(overrides: Record<string, unknown> = {}) {
+      return createQueue({
+        isPaused: jest.fn().mockResolvedValue(false),
+        getWaitingCount: jest.fn().mockResolvedValue(0),
+        getActiveCount: jest.fn().mockResolvedValue(0),
+        getCompletedCount: jest.fn().mockResolvedValue(0),
+        getFailedCount: jest.fn().mockResolvedValue(3),
+        getDelayedCount: jest.fn().mockResolvedValue(0),
+        ...overrides,
+      });
+    }
+
+    it('is omitted entirely when the jobs endpoint is off', async () => {
+      // 'stats' cannot be disabled, so a failure reason must not ride along on
+      // it without the same opt-in the inspection endpoint requires.
+      const service = createService();
+      const queue = statsQueue();
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats).not.toHaveProperty('lastFailure');
+      expect(queue.getFailed).not.toHaveBeenCalled();
+    });
+
+    it('reports the newest failure when the endpoint is on', async () => {
+      const service = createService({ endpoints: ['jobs'] });
+      const queue = statsQueue();
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      // getFailed returns the failed set newest-first, so index 0 is latest.
+      expect(queue.getFailed).toHaveBeenCalledWith(0, 0);
+      expect(stats.lastFailure).toEqual({
+        jobId: 'j1',
+        name: 'send-email',
+        failedReason: 'boom',
+        finishedOn: 3_000,
+      });
+    });
+
+    it('costs nothing on a queue with no failures', async () => {
+      const service = createService({ endpoints: ['jobs'] });
+      const queue = statsQueue({
+        getFailedCount: jest.fn().mockResolvedValue(0),
+      });
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.lastFailure).toBeNull();
+      expect(queue.getFailed).not.toHaveBeenCalled();
+    });
+
+    it('never withholds job data through lastFailure', async () => {
+      const service = createService({ endpoints: ['jobs'] });
+      const queue = statsQueue();
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.lastFailure).not.toHaveProperty('data');
+    });
+
+    it('runs the jobRedaction hook over it', async () => {
+      const service = createService({
+        endpoints: ['jobs'],
+        jobRedaction: (info) => ({ ...info, failedReason: '[scrubbed]' }),
+      });
+      const queue = statsQueue();
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.lastFailure?.failedReason).toBe('[scrubbed]');
+    });
+
+    it('does not fail the whole stats response when the read throws', async () => {
+      const service = createService({ endpoints: ['jobs'] });
+      const queue = statsQueue({
+        getFailed: jest.fn().mockRejectedValue(new Error('redis down')),
+      });
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.counts.failed).toBe(3);
+      expect(stats.lastFailure).toBeNull();
+    });
+  });
 });

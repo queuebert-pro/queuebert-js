@@ -147,6 +147,22 @@ failed. A hook that throws is logged and swallowed; the original job error is
 always the one rethrown. `onJobCompleted(job, result, ctx)` is available for
 symmetry.
 
+### Lifecycle events
+
+`QueuebertWorker` emits `job:failed` for every failed attempt and
+`job:retrying` additionally when BullMQ will try the job again. Both carry
+`attempt`, `maxAttempts` and `isFinalAttempt`, derived from the same logic as
+`onJobFailed`, so a listener never has to repeat BullMQ's retry arithmetic:
+
+```ts
+worker.on('job:failed', ({ jobId, error, isFinalAttempt }) => {
+  if (isFinalAttempt) Sentry.captureException(error, { extra: { jobId } });
+});
+```
+
+Note that `job:failed` fires on every attempt, so filter on `isFinalAttempt`
+rather than assuming it means the job is finished.
+
 Register that processor with `@queuebert/nest`:
 
 ```ts

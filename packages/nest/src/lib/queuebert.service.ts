@@ -18,6 +18,7 @@ import type {
   PerformanceMetrics,
   QueueCounts,
   SingleQueueStats,
+  QueueLastFailure,
   MultiQueueStats,
   CleanResult,
   DrainResult,
@@ -688,6 +689,8 @@ export class QueuebertService implements OnModuleDestroy {
       processorStats?.jobsByType,
     );
 
+    const lastFailure = await this.getLastFailure(queue, counts);
+
     return {
       name: statsKey ?? queue.name,
       paused,
@@ -720,8 +723,52 @@ export class QueuebertService implements OnModuleDestroy {
         jobsInWindow: processorStats?.throughput.jobsInWindow ?? 0,
       },
       jobTypes,
+      ...(lastFailure !== undefined ? { lastFailure } : {}),
       custom: processorStats?.custom,
     };
+  }
+
+  /**
+   * Read the newest failure for a queue, for the stats response.
+   *
+   * Returns undefined when the caller should not see it at all, and null when
+   * the queue simply has no failures.
+   *
+   * Two things keep this cheap: it is skipped entirely unless the 'jobs'
+   * endpoint is enabled, and skipped again when the failed count is already
+   * zero, so a healthy queue costs nothing. `getFailed(0, 0)` reads the newest
+   * entry because BullMQ returns the failed set newest-first.
+   */
+  private async getLastFailure(
+    queue: Queue,
+    counts: QueueCounts,
+  ): Promise<QueueLastFailure | null | undefined> {
+    if (!this.enabledEndpoints.has('jobs')) return undefined;
+    if (counts.failed === 0) return null;
+
+    try {
+      const [job] = await queue.getFailed(0, 0);
+      if (!job) return null;
+
+      // Run the same privacy path as the inspection endpoints so a configured
+      // jobRedaction hook applies here too.
+      const info = this.applyJobPrivacy(this.toJobInfo(job, 'failed'));
+
+      return {
+        jobId: info.id,
+        name: info.name,
+        ...(info.failedReason ? { failedReason: info.failedReason } : {}),
+        ...(info.finishedOn !== undefined
+          ? { finishedOn: info.finishedOn }
+          : {}),
+      };
+    } catch (error) {
+      // Stats must not fail because of this; the caller still gets counts.
+      this.logger.warn(
+        `Failed to read last failure for queue ${queue.name}: ${error}`,
+      );
+      return null;
+    }
   }
 
   /**

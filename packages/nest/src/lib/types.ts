@@ -258,6 +258,21 @@ export interface JobTypesDiscovery {
 /**
  * Stats for a single queue
  */
+/**
+ * Summary of the most recent failure in a queue.
+ *
+ * Only present when the 'jobs' endpoint is enabled: `failedReason` is the same
+ * risk class as the job inspection endpoint, and 'stats' cannot be disabled,
+ * so it is not surfaced without that opt-in.
+ */
+export interface QueueLastFailure {
+  jobId: string;
+  name: string;
+  failedReason?: string;
+  /** When the job failed (ms since epoch) */
+  finishedOn?: number;
+}
+
 export interface SingleQueueStats {
   name: string;
   /** Redis instance ID this queue belongs to */
@@ -268,6 +283,14 @@ export interface SingleQueueStats {
   throughput: ThroughputStats;
   /** Discovered job types in the queue */
   jobTypes?: JobTypesDiscovery;
+  /**
+   * The newest failure in the queue, or null when there are none.
+   *
+   * Omitted entirely unless the 'jobs' endpoint is enabled. Saves a dashboard
+   * a second request to answer "what failed last?", at the cost of one Redis
+   * round-trip per queue with a non-zero failed count.
+   */
+  lastFailure?: QueueLastFailure | null;
   custom?: Record<string, unknown>;
 }
 

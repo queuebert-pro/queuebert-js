@@ -1,6 +1,6 @@
 import { WorkerHost } from '@nestjs/bullmq';
 import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Job, UnrecoverableError, Worker } from 'bullmq';
+import { Job, Worker } from 'bullmq';
 
 import type {
   QueuebertProcessor,
@@ -8,6 +8,11 @@ import type {
   QueuebertCacheConfig,
 } from '@queuebert/nest';
 
+import {
+  resolveRetryOutcome,
+  trackDiscard,
+  type RetryOutcome,
+} from './retry-outcome';
 import { DurationStatsCollector } from './stats-collector';
 
 const STATS_LOG_INTERVAL = 30000; // Log stats every 30 seconds
@@ -47,33 +52,7 @@ export interface BaseQueueProcessorOptions {
  * Context passed to `onJobFailed` describing where the failure sits in the
  * job's retry lifecycle.
  */
-export interface JobFailureContext {
-  /**
-   * 1-based number of the attempt that just failed.
-   *
-   * Mirrors BullMQ's own retry math, which compares `attemptsMade + 1` against
-   * `opts.attempts`. `attemptsMade` is not yet incremented when the handler
-   * throws, so this is the attempt you are currently in.
-   */
-  attempt: number;
-  /** Configured attempt ceiling (`opts.attempts`), defaulting to 1 */
-  maxAttempts: number;
-  /**
-   * True when BullMQ will not retry this job.
-   *
-   * Covers all three reasons BullMQ declines a retry: the attempt ceiling is
-   * reached, the handler called `job.discard()`, or the error is an
-   * `UnrecoverableError`.
-   *
-   * Caveat: a custom `backoffStrategy` returning -1 also stops retries, and
-   * that cannot be known without running the strategy. If you rely on one,
-   * treat this as a lower bound.
-   */
-  isFinalAttempt: boolean;
-  /** True when the handler called `job.discard()` during this attempt */
-  discarded: boolean;
-  /** True when the error is (or reports itself as) an `UnrecoverableError` */
-  unrecoverable: boolean;
+export interface JobFailureContext extends RetryOutcome {
   /** Wall-clock ms spent in `processJob()` for this attempt */
   durationMs: number;
 }
@@ -86,19 +65,6 @@ export interface JobCompletionContext {
   attempt: number;
   /** Wall-clock ms spent in `processJob()` for this attempt */
   durationMs: number;
-}
-
-/**
- * Mirrors BullMQ's own check in `Job.shouldRetryJob()`, including the name
- * fallback that catches an `UnrecoverableError` from a duplicate bullmq copy.
- */
-function isUnrecoverableError(error: unknown): boolean {
-  if (error instanceof UnrecoverableError) return true;
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { name?: unknown }).name === 'UnrecoverableError'
-  );
 }
 
 /**
@@ -402,7 +368,7 @@ export abstract class BaseQueueProcessor
     this.lastJobTime = new Date();
 
     // BullMQ keeps the discard flag private, so observe the call instead.
-    const discardTracker = this.trackDiscard(job);
+    const discardTracker = trackDiscard(job);
 
     try {
       const result = await this.processJob(job);
@@ -427,12 +393,10 @@ export abstract class BaseQueueProcessor
 
       this.jobsFailed++;
 
-      const ctx = this.buildJobFailureContext(
-        job,
-        error,
-        duration,
-        discardTracker.wasDiscarded(),
-      );
+      const ctx: JobFailureContext = {
+        ...resolveRetryOutcome(job, error, discardTracker.wasDiscarded()),
+        durationMs: duration,
+      };
       await this.runJobHook('onJobFailed', () =>
         this.onJobFailed(job, error, ctx),
       );
@@ -441,63 +405,6 @@ export abstract class BaseQueueProcessor
     } finally {
       discardTracker.restore();
     }
-  }
-
-  /**
-   * Derive retry-lifecycle context for a failed attempt, mirroring BullMQ's
-   * `Job.shouldRetryJob()`.
-   */
-  private buildJobFailureContext(
-    job: Job,
-    error: unknown,
-    durationMs: number,
-    discarded: boolean,
-  ): JobFailureContext {
-    const maxAttempts = job.opts?.attempts ?? 1;
-    const attempt = (job.attemptsMade ?? 0) + 1;
-    const unrecoverable = isUnrecoverableError(error);
-
-    return {
-      attempt,
-      maxAttempts,
-      isFinalAttempt: discarded || unrecoverable || attempt >= maxAttempts,
-      discarded,
-      unrecoverable,
-      durationMs,
-    };
-  }
-
-  /**
-   * Wrap `job.discard()` so the base class can tell whether the handler asked
-   * BullMQ to stop retrying. The flag itself is protected on BullMQ's Job.
-   */
-  private trackDiscard(job: Job): {
-    wasDiscarded: () => boolean;
-    restore: () => void;
-  } {
-    const original = job.discard;
-    if (typeof original !== 'function') {
-      return { wasDiscarded: () => false, restore: () => undefined };
-    }
-
-    let discarded = false;
-    const hadOwnDiscard = Object.prototype.hasOwnProperty.call(job, 'discard');
-
-    job.discard = function trackedDiscard(this: Job): void {
-      discarded = true;
-      return original.call(this);
-    };
-
-    return {
-      wasDiscarded: () => discarded,
-      restore: () => {
-        if (hadOwnDiscard) {
-          job.discard = original;
-        } else {
-          delete (job as Partial<Job>).discard;
-        }
-      },
-    };
   }
 
   /**

@@ -396,6 +396,102 @@ describe('QueuebertWorker', () => {
       );
     });
 
+    it('reports the retry lifecycle on job:failed', async () => {
+      mockProcessor.mockRejectedValue(new Error('Job failed'));
+      const failListener = jest.fn();
+      worker.on('job:failed', failListener);
+
+      await expect(
+        wrappedProcessor({ ...mockJob, opts: { attempts: 3 } }, 'token'),
+      ).rejects.toThrow('Job failed');
+
+      expect(failListener).toHaveBeenCalledWith(
+        expect.objectContaining({
+          attempt: 1,
+          maxAttempts: 3,
+          isFinalAttempt: false,
+        }),
+      );
+    });
+
+    it('emits job:retrying when another attempt is coming', async () => {
+      mockProcessor.mockRejectedValue(new Error('Job failed'));
+      const retryListener = jest.fn();
+      worker.on('job:retrying', retryListener);
+
+      await expect(
+        wrappedProcessor(
+          { ...mockJob, attemptsMade: 1, opts: { attempts: 3 } },
+          'token',
+        ),
+      ).rejects.toThrow('Job failed');
+
+      expect(retryListener).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'job:retrying',
+          jobId: 'job-123',
+          jobName: 'test-job',
+          queueName: 'test-queue',
+          attempt: 2,
+          maxAttempts: 3,
+          isFinalAttempt: false,
+          error: expect.any(Error),
+        }),
+      );
+    });
+
+    it('does not emit job:retrying on the final attempt', async () => {
+      mockProcessor.mockRejectedValue(new Error('Job failed'));
+      const retryListener = jest.fn();
+      const failListener = jest.fn();
+      worker.on('job:retrying', retryListener);
+      worker.on('job:failed', failListener);
+
+      await expect(
+        wrappedProcessor(
+          { ...mockJob, attemptsMade: 2, opts: { attempts: 3 } },
+          'token',
+        ),
+      ).rejects.toThrow('Job failed');
+
+      expect(retryListener).not.toHaveBeenCalled();
+      expect(failListener).toHaveBeenCalledWith(
+        expect.objectContaining({ attempt: 3, isFinalAttempt: true }),
+      );
+    });
+
+    it('does not emit job:retrying for an unrecoverable error', async () => {
+      const unrecoverable = new Error('do not retry');
+      unrecoverable.name = 'UnrecoverableError';
+      mockProcessor.mockRejectedValue(unrecoverable);
+      const retryListener = jest.fn();
+      worker.on('job:retrying', retryListener);
+
+      await expect(
+        wrappedProcessor({ ...mockJob, opts: { attempts: 3 } }, 'token'),
+      ).rejects.toThrow('do not retry');
+
+      expect(retryListener).not.toHaveBeenCalled();
+    });
+
+    it('does not emit job:retrying when the handler discarded the job', async () => {
+      mockProcessor.mockImplementation(async (job: { discard: () => void }) => {
+        job.discard();
+        throw new Error('Job failed');
+      });
+      const retryListener = jest.fn();
+      worker.on('job:retrying', retryListener);
+
+      await expect(
+        wrappedProcessor(
+          { ...mockJob, opts: { attempts: 3 }, discard: jest.fn() },
+          'token',
+        ),
+      ).rejects.toThrow('Job failed');
+
+      expect(retryListener).not.toHaveBeenCalled();
+    });
+
     it('should track job duration', async () => {
       await wrappedProcessor(mockJob, 'token');
 
