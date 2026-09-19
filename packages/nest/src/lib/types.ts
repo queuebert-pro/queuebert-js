@@ -310,6 +310,43 @@ export interface WorkerStopRecord {
 }
 
 /**
+ * What a pause request may carry. Both fields are optional; an empty body
+ * pauses with no note.
+ */
+export interface PauseRequest {
+  /** Why the queue is paused, at most 200 characters. */
+  reason?: string;
+  /** When to resume automatically (ISO 8601), at most 7 days out. */
+  until?: string;
+}
+
+/**
+ * How the service is asked to pause: a request plus where it came from.
+ */
+export interface PauseOptions extends PauseRequest {
+  /**
+   * `api` for the HTTP endpoints, `migration` for the pauses a migration
+   * performs; programmatic callers may pass their own short token.
+   */
+  source?: string;
+}
+
+/**
+ * The note stored beside a queue's paused flag and reported in stats.
+ *
+ * Present only while the queue is paused and the note exists. A queue paused
+ * outside Queuebert reports `paused: true` with no note.
+ */
+export interface QueuePauseInfo {
+  reason?: string;
+  /** When the pause began (ISO 8601). */
+  pausedAt?: string;
+  /** When the queue resumes automatically (ISO 8601), when one was set. */
+  until?: string;
+  source?: string;
+}
+
+/**
  * Worker presence for a queue: how many Queuebert workers are alive and why
  * the last one stopped.
  *
@@ -326,6 +363,8 @@ export interface SingleQueueStats {
   /** Redis instance ID this queue belongs to */
   redis: string;
   paused: boolean;
+  /** Why and since when the queue is paused, when a note was recorded. */
+  pause?: QueuePauseInfo;
   counts: QueueCounts;
   jobMetrics: QueueJobMetrics;
   throughput: ThroughputStats;
@@ -454,6 +493,16 @@ export interface QueuebertCapabilities {
   endpoints: QueuebertEndpoint[];
   /** Whether pause/resume operations are available */
   canPause: boolean;
+  /**
+   * Whether the pause endpoints accept a JSON body with a `reason` and report
+   * it in stats. Absent on older servers, so compare explicitly.
+   */
+  canPauseWithReason: boolean;
+  /**
+   * Whether a pause may carry an `until` that the server honours by resuming
+   * the queue itself. Absent on older servers, so compare explicitly.
+   */
+  canPauseUntil: boolean;
   /** Whether clean operation is available */
   canClean: boolean;
   /** Whether drain operation is available */
@@ -551,7 +600,10 @@ export interface DrainResult {
  */
 export interface StatusResult {
   status: 'paused' | 'resumed';
+  /** The stored reason, after trimming, when the pause carried one. */
   reason?: string;
+  /** The stored auto-resume time, when the pause carried one. */
+  until?: string;
   queues?: string[];
   timestamp: string;
 }

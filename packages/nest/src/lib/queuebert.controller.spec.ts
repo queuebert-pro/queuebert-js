@@ -224,10 +224,36 @@ describe('QueuebertController', () => {
       const result = await controller.pauseAll();
 
       expect(queuebertService.isEndpointEnabled).toHaveBeenCalledWith('pause');
-      expect(queuebertService.pauseQueues).toHaveBeenCalledWith([
-        { queue: mockQueue, statsKey: 'test-queue' },
-      ]);
+      expect(queuebertService.pauseQueues).toHaveBeenCalledWith(
+        [{ queue: mockQueue, statsKey: 'test-queue' }],
+        { source: 'api' },
+      );
       expect(result).toEqual(expectedResult);
+    });
+
+    it('passes a reason and until from the body', async () => {
+      (queuebertService.pauseQueues as jest.Mock).mockResolvedValue({
+        status: 'paused',
+        timestamp: '',
+      });
+      const until = new Date(Date.now() + 60_000).toISOString();
+
+      await controller.pauseAll({ reason: '  Deploy ', until });
+
+      expect(queuebertService.pauseQueues).toHaveBeenCalledWith(
+        [{ queue: mockQueue, statsKey: 'test-queue' }],
+        { reason: 'Deploy', until, source: 'api' },
+      );
+    });
+
+    it('rejects an invalid body with 400 before touching any queue', async () => {
+      await expect(
+        controller.pauseAll({ reason: 'x'.repeat(201) }),
+      ).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+      await expect(
+        controller.pauseAll({ until: '2000-01-01T00:00:00.000Z' }),
+      ).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+      expect(queuebertService.pauseQueues).not.toHaveBeenCalled();
     });
 
     it('should throw 404 when pause endpoint is disabled', async () => {
@@ -339,10 +365,32 @@ describe('QueuebertController', () => {
       expect(queuebertService.isEndpointEnabled).toHaveBeenCalledWith('pause');
       expect(queuebertService.pauseQueue).toHaveBeenCalledWith(
         mockQueue,
-        'manual-pause',
+        { source: 'api' },
         'test-queue',
       );
       expect(result).toEqual(expectedResult);
+    });
+
+    it('passes a reason from the body', async () => {
+      (queuebertService.pauseQueue as jest.Mock).mockResolvedValue({
+        status: 'paused',
+        timestamp: '',
+      });
+
+      await controller.pauseQueue('test-queue', { reason: 'Incident' });
+
+      expect(queuebertService.pauseQueue).toHaveBeenCalledWith(
+        mockQueue,
+        { reason: 'Incident', source: 'api' },
+        'test-queue',
+      );
+    });
+
+    it('rejects a non-object body with 400', async () => {
+      await expect(
+        controller.pauseQueue('test-queue', 'deploy'),
+      ).rejects.toMatchObject({ status: HttpStatus.BAD_REQUEST });
+      expect(queuebertService.pauseQueue).not.toHaveBeenCalled();
     });
 
     it('should throw 404 when queue is not found', async () => {

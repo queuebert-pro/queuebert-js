@@ -354,9 +354,10 @@ describe('QueuebertService migration and cache behavior', () => {
       reason: 'maintenance',
       queues: ['primary'],
     });
+    // The note is a JSON document now; a bare string is still read back.
     expect(queue.__redis.set).toHaveBeenCalledWith(
       'bull:emails:pause-reason',
-      'maintenance',
+      expect.stringContaining('"reason":"maintenance"'),
     );
 
     await expect(service.resumeQueue(queue, 'primary')).resolves.toMatchObject({
@@ -384,11 +385,11 @@ describe('QueuebertService migration and cache behavior', () => {
     expect(reports.pause).toHaveBeenCalled();
     expect(emails.__redis.set).toHaveBeenCalledWith(
       'bull:emails:pause-reason',
-      'deploy',
+      expect.stringContaining('"reason":"deploy"'),
     );
     expect(reports.__redis.set).toHaveBeenCalledWith(
       'bull:reports:pause-reason',
-      'deploy',
+      expect.stringContaining('"reason":"deploy"'),
     );
 
     await expect(service.resumeQueues(queues)).resolves.toMatchObject({

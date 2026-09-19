@@ -1190,4 +1190,71 @@ describe('job inspection', () => {
       expect(stats.counts.waiting).toBe(0);
     });
   });
+
+  describe('pause note on queue stats', () => {
+    function pausedQueue(paused: boolean, stored: string | null) {
+      return createQueue({
+        isPaused: jest.fn().mockResolvedValue(paused),
+        getWaitingCount: jest.fn().mockResolvedValue(0),
+        getActiveCount: jest.fn().mockResolvedValue(0),
+        getCompletedCount: jest.fn().mockResolvedValue(0),
+        getFailedCount: jest.fn().mockResolvedValue(0),
+        getDelayedCount: jest.fn().mockResolvedValue(0),
+        client: Promise.resolve({ get: jest.fn().mockResolvedValue(stored) }),
+      });
+    }
+
+    it('reports the stored note while paused', async () => {
+      const service = createService();
+      const queue = pausedQueue(
+        true,
+        JSON.stringify({
+          reason: 'Deploying api v2.3',
+          pausedAt: '2026-09-19T12:00:00.000Z',
+          source: 'api',
+        }),
+      );
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.paused).toBe(true);
+      expect(stats.pause).toEqual({
+        reason: 'Deploying api v2.3',
+        pausedAt: '2026-09-19T12:00:00.000Z',
+        source: 'api',
+      });
+    });
+
+    it('keeps a bare-string reason from an earlier version', async () => {
+      const service = createService();
+      const queue = pausedQueue(true, 'manual-pause');
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.pause).toEqual({ reason: 'manual-pause' });
+    });
+
+    it('omits the note for a queue paused outside Queuebert', async () => {
+      const service = createService();
+      const queue = pausedQueue(true, null);
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.paused).toBe(true);
+      expect(stats).not.toHaveProperty('pause');
+    });
+
+    it('does not read the note for a running queue', async () => {
+      const service = createService();
+      const queue = pausedQueue(false, 'stale');
+      const client = await (
+        queue as unknown as { client: Promise<{ get: jest.Mock }> }
+      ).client;
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats).not.toHaveProperty('pause');
+      expect(client.get).not.toHaveBeenCalled();
+    });
+  });
 });

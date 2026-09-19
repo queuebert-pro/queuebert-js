@@ -436,6 +436,236 @@ describe('QueuebertService', () => {
     });
   });
 
+  describe('pause notes', () => {
+    function createPausableQueue(
+      name: string,
+      paused = false,
+      stored: string | null = null,
+    ) {
+      const store = new Map<string, string>();
+      if (stored) store.set(`bull:${name}:pause-reason`, stored);
+      const client = {
+        get: jest.fn(async (key: string) => store.get(key) ?? null),
+        set: jest.fn(async (key: string, value: string) => {
+          store.set(key, value);
+          return 'OK';
+        }),
+        del: jest.fn(async (key: string) => {
+          store.delete(key);
+          return 1;
+        }),
+      };
+      let isPaused = paused;
+      const queue = {
+        name,
+        client: Promise.resolve(client),
+        isPaused: jest.fn(async () => isPaused),
+        pause: jest.fn(async () => {
+          isPaused = true;
+        }),
+        resume: jest.fn(async () => {
+          isPaused = false;
+        }),
+      };
+      return { queue, client, store };
+    }
+
+    it('pauses and stores a note with when and why', async () => {
+      const { queue, store } = createPausableQueue('emails');
+
+      const result = await service.pauseQueue(
+        queue as never,
+        { reason: 'Deploy', until: '2026-09-19T13:00:00.000Z', source: 'api' },
+        'emails',
+      );
+
+      expect(queue.pause).toHaveBeenCalledTimes(1);
+      const note = JSON.parse(store.get('bull:emails:pause-reason') ?? '{}');
+      expect(note).toEqual({
+        reason: 'Deploy',
+        pausedAt: expect.any(String),
+        until: '2026-09-19T13:00:00.000Z',
+        source: 'api',
+      });
+      expect(result).toMatchObject({
+        status: 'paused',
+        reason: 'Deploy',
+        until: '2026-09-19T13:00:00.000Z',
+        queues: ['emails'],
+      });
+    });
+
+    it('stores a note with no reason when none is given', async () => {
+      const { queue, store } = createPausableQueue('emails');
+
+      const result = await service.pauseQueue(queue as never);
+
+      const note = JSON.parse(store.get('bull:emails:pause-reason') ?? '{}');
+      expect(note).toEqual({ pausedAt: expect.any(String), source: 'api' });
+      expect(result).not.toHaveProperty('reason');
+    });
+
+    it('updates the note of a paused queue without pausing again', async () => {
+      const { queue, store } = createPausableQueue(
+        'emails',
+        true,
+        JSON.stringify({
+          pausedAt: '2026-09-19T12:00:00.000Z',
+          source: 'api',
+        }),
+      );
+
+      await service.pauseQueue(queue as never, { reason: 'Incident' });
+
+      expect(queue.pause).not.toHaveBeenCalled();
+      expect(JSON.parse(store.get('bull:emails:pause-reason') ?? '{}')).toEqual(
+        {
+          reason: 'Incident',
+          pausedAt: '2026-09-19T12:00:00.000Z',
+          source: 'api',
+        },
+      );
+    });
+
+    it('accepts a bare string reason from older callers', async () => {
+      const { queue, store } = createPausableQueue('emails');
+
+      await service.pauseQueue(queue as never, 'manual-pause');
+
+      expect(
+        JSON.parse(store.get('bull:emails:pause-reason') ?? '{}'),
+      ).toMatchObject({
+        reason: 'manual-pause',
+      });
+    });
+
+    it('pauses several queues with one note and clears it on resume', async () => {
+      const a = createPausableQueue('a');
+      const b = createPausableQueue('b', true, 'old');
+      const queues = [
+        { queue: a.queue as never, statsKey: 'a' },
+        { queue: b.queue as never, statsKey: 'b' },
+      ];
+
+      const result = await service.pauseQueues(queues, {
+        reason: 'Maintenance',
+      });
+
+      expect(a.queue.pause).toHaveBeenCalledTimes(1);
+      expect(b.queue.pause).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        reason: 'Maintenance',
+        queues: ['a', 'b'],
+      });
+      expect(
+        JSON.parse(a.store.get('bull:a:pause-reason') ?? '{}').reason,
+      ).toBe('Maintenance');
+
+      await service.resumeQueues(queues);
+
+      expect(a.store.has('bull:a:pause-reason')).toBe(false);
+      expect(b.store.has('bull:b:pause-reason')).toBe(false);
+    });
+
+    it('resumes a queue whose until has passed, and only then', async () => {
+      const due = createPausableQueue(
+        'due',
+        true,
+        JSON.stringify({ until: '2026-09-19T12:00:00.000Z', source: 'api' }),
+      );
+      const later = createPausableQueue(
+        'later',
+        true,
+        JSON.stringify({ until: '2026-09-19T13:00:00.000Z', source: 'api' }),
+      );
+      const open = createPausableQueue(
+        'open',
+        true,
+        JSON.stringify({ reason: 'x' }),
+      );
+      const running = createPausableQueue('running');
+      const getQueues = () =>
+        new Map([
+          ['due', { queue: due.queue as never }],
+          ['later', { queue: later.queue as never }],
+          ['open', { queue: open.queue as never }],
+          ['running', { queue: running.queue as never }],
+        ]);
+      const timed = new QueuebertService(
+        { queues: [], endpoints: ['pause', 'resume'] },
+        new QueuebertIntegrationRegistry(),
+        getQueues,
+      );
+
+      const resumed = await timed.resumeExpiredPauses(
+        Date.parse('2026-09-19T12:30:00.000Z'),
+      );
+
+      expect(resumed).toEqual(['due']);
+      expect(due.queue.resume).toHaveBeenCalledTimes(1);
+      expect(due.store.has('bull:due:pause-reason')).toBe(false);
+      expect(later.queue.resume).not.toHaveBeenCalled();
+      expect(open.queue.resume).not.toHaveBeenCalled();
+      expect(running.queue.resume).not.toHaveBeenCalled();
+    });
+
+    it('reports canPauseUntil only with the queues in hand', () => {
+      const alone = new QueuebertService(
+        { queues: [], endpoints: ['pause', 'resume'] },
+        new QueuebertIntegrationRegistry(),
+      );
+      const withQueues = new QueuebertService(
+        { queues: [], endpoints: ['pause', 'resume'] },
+        new QueuebertIntegrationRegistry(),
+        () => new Map(),
+      );
+      const readOnly = new QueuebertService(
+        { queues: [] },
+        new QueuebertIntegrationRegistry(),
+        () => new Map(),
+      );
+
+      expect(alone.getCapabilities()).toMatchObject({
+        canPauseWithReason: true,
+        canPauseUntil: false,
+      });
+      expect(withQueues.getCapabilities()).toMatchObject({
+        canPauseWithReason: true,
+        canPauseUntil: true,
+      });
+      expect(readOnly.getCapabilities()).toMatchObject({
+        canPauseWithReason: false,
+        canPauseUntil: false,
+      });
+    });
+
+    it('runs the ticker on module init and stops it on destroy', async () => {
+      jest.useFakeTimers();
+      try {
+        const due = createPausableQueue(
+          'due',
+          true,
+          JSON.stringify({ until: '2000-01-01T00:00:00.000Z' }),
+        );
+        const timed = new QueuebertService(
+          { queues: [], endpoints: ['pause', 'resume'] },
+          new QueuebertIntegrationRegistry(),
+          () => new Map([['due', { queue: due.queue as never }]]),
+        );
+
+        timed.onModuleInit();
+        await jest.advanceTimersByTimeAsync(30_000);
+        expect(due.queue.resume).toHaveBeenCalledTimes(1);
+
+        await timed.onModuleDestroy();
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(due.queue.resume).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
   describe('Redis instance mapping', () => {
     it('should use default instance ID for single Redis setup', async () => {
       const svc = await createService();

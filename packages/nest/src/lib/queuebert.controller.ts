@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   Get,
   Post,
@@ -12,6 +13,7 @@ import {
 import type { Type } from '@nestjs/common';
 import * as BullMQ from 'bullmq';
 
+import { parsePauseRequest, PauseRequestError } from './pause-note';
 import { QueuebertService } from './queuebert.service';
 import {
   QUEUEBERT_OPTIONS,
@@ -89,6 +91,20 @@ function parseNonNegativeInteger(
     );
   }
   return parsed;
+}
+
+/**
+ * Validate a pause body, turning a rejection into a 400 the client can show.
+ */
+function readPauseRequest(body: unknown) {
+  try {
+    return parsePauseRequest(body);
+  } catch (error) {
+    if (error instanceof PauseRequestError) {
+      throw new HttpException(error.message, HttpStatus.BAD_REQUEST);
+    }
+    throw error;
+  }
 }
 
 function parseMigrationStates(
@@ -175,10 +191,10 @@ function unwrapJobOutcome<T>(outcome: JobControlOutcome<T>): T {
  */
 export interface IQueuebertController {
   getAllStats(): Promise<unknown>;
-  pauseAll(): Promise<unknown>;
+  pauseAll(body?: unknown): Promise<unknown>;
   resumeAll(): Promise<unknown>;
   getQueueStats(queueName: string): Promise<unknown>;
-  pauseQueue(queueName: string): Promise<unknown>;
+  pauseQueue(queueName: string, body?: unknown): Promise<unknown>;
   resumeQueue(queueName: string): Promise<unknown>;
   cleanQueue(
     queueName: string,
@@ -337,18 +353,23 @@ export function createQueuebertController(
 
     /**
      * POST /pause
-     * Pause all configured queues
+     * Pause all configured queues. An optional JSON body carries a `reason`
+     * and an auto-resume `until`; see `parsePauseRequest` for the limits.
      */
     @Post('pause')
-    async pauseAll() {
+    async pauseAll(@Body() body?: unknown) {
       this.requireEndpoint('pause');
+      const request = readPauseRequest(body);
       const queuesWithKeys = Array.from(this.queues.entries()).map(
         ([statsKey, { queue }]) => ({
           queue,
           statsKey,
         }),
       );
-      return this._queuebertService.pauseQueues(queuesWithKeys);
+      return this._queuebertService.pauseQueues(queuesWithKeys, {
+        ...request,
+        source: 'api',
+      });
     }
 
     /**
@@ -399,15 +420,21 @@ export function createQueuebertController(
 
     /**
      * POST /:queueName/pause
-     * Pause a specific queue
+     * Pause a specific queue. An optional JSON body carries a `reason` and an
+     * auto-resume `until`. Posting to a queue that is already paused updates
+     * the note, which is how a client attaches a reason after pausing.
      */
     @Post(':queueName/pause')
-    async pauseQueue(@Param('queueName') queueName: string) {
+    async pauseQueue(
+      @Param('queueName') queueName: string,
+      @Body() body?: unknown,
+    ) {
       this.requireEndpoint('pause');
+      const request = readPauseRequest(body);
       const { queue } = this.getQueueByName(queueName);
       return this._queuebertService.pauseQueue(
         queue,
-        'manual-pause',
+        { ...request, source: 'api' },
         queueName,
       );
     }

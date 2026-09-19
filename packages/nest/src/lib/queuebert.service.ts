@@ -1,11 +1,25 @@
-import { Injectable, Inject, Logger, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Inject,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Job, Queue } from 'bullmq';
 
 import type { QueuebertIntegrationRegistry } from './integration-registry';
+import {
+  decodePauseNote,
+  encodePauseNote,
+  isPauseExpired,
+  pauseNoteKey,
+} from './pause-note';
 import { isPresenceRedis, readWorkerPresence } from './worker-presence';
 import {
   QUEUEBERT_OPTIONS,
+  QUEUEBERT_QUEUES,
   QUEUEBERT_INTEGRATION_REGISTRY,
   READONLY_OPTIONAL_ENDPOINTS,
   RETRYABLE_JOB_STATES,
@@ -21,6 +35,8 @@ import type {
   SingleQueueStats,
   QueueLastFailure,
   QueueWorkersStats,
+  PauseOptions,
+  QueuePauseInfo,
   MultiQueueStats,
   CleanResult,
   DrainResult,
@@ -86,10 +102,12 @@ interface MigrationQueueGuard {
 class MigrationRollbackError extends Error {}
 
 const MIGRATION_LOCK_TTL_MS = 5 * 60 * 1000;
+/** How often timed pauses are checked for expiry. */
+const PAUSE_AUTO_RESUME_INTERVAL_MS = 30 * 1000;
 const MAX_MIGRATION_ERRORS = 100;
 
 @Injectable()
-export class QueuebertService implements OnModuleDestroy {
+export class QueuebertService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(QueuebertService.name);
   private readonly enabledEndpoints: Set<QueuebertEndpoint>;
 
@@ -104,6 +122,14 @@ export class QueuebertService implements OnModuleDestroy {
     @Inject(QUEUEBERT_OPTIONS) private readonly options: QueuebertModuleOptions,
     @Inject(QUEUEBERT_INTEGRATION_REGISTRY)
     private readonly integrationRegistry: QueuebertIntegrationRegistry,
+    /**
+     * The configured queues, for the auto-resume ticker. Optional so the
+     * service still constructs on its own, in which case timed pauses are
+     * stored but not honoured and `canPauseUntil` says so.
+     */
+    @Optional()
+    @Inject(QUEUEBERT_QUEUES)
+    private readonly getQueues?: () => Map<string, { queue: Queue }>,
   ) {
     // Build set of enabled endpoints (stats is always enabled).
     // Default to read-only behavior; destructive controls must be opted in.
@@ -118,8 +144,16 @@ export class QueuebertService implements OnModuleDestroy {
     }
   }
 
+  onModuleInit(): void {
+    this.startAutoResume();
+  }
+
   async onModuleDestroy(): Promise<void> {
     this.isShuttingDown = true;
+    if (this.autoResumeTimer) {
+      clearInterval(this.autoResumeTimer);
+      this.autoResumeTimer = null;
+    }
     const runPromises: Promise<void>[] = [];
 
     for (const migration of this.activeMigrations.values()) {
@@ -188,6 +222,8 @@ export class QueuebertService implements OnModuleDestroy {
       canPause:
         this.enabledEndpoints.has('pause') &&
         this.enabledEndpoints.has('resume'),
+      canPauseWithReason: this.enabledEndpoints.has('pause'),
+      canPauseUntil: this.enabledEndpoints.has('pause') && !!this.getQueues,
       canClean: this.enabledEndpoints.has('clean'),
       canDrain: this.enabledEndpoints.has('drain'),
       canInspectJobs: this.enabledEndpoints.has('jobs'),
@@ -204,7 +240,110 @@ export class QueuebertService implements OnModuleDestroy {
    * Get the Redis key for storing pause reason
    */
   private getPauseReasonKey(queueName: string): string {
-    return `bull:${queueName}:pause-reason`;
+    return pauseNoteKey(queueName);
+  }
+
+  /**
+   * The note stored for a paused queue, or undefined when there is none or
+   * it cannot be read. Never fails a stats request.
+   */
+  async getPauseInfo(queue: Queue): Promise<QueuePauseInfo | undefined> {
+    try {
+      const client = await queue.client;
+      if (!client || typeof client.get !== 'function') return undefined;
+      return decodePauseNote(
+        await client.get(this.getPauseReasonKey(queue.name)),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to read pause note for queue ${queue.name}: ${error}`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Store a pause note for a queue. A queue that was already paused keeps its
+   * original `pausedAt`, so re-posting a pause only changes the note.
+   */
+  private async writePauseNote(
+    queue: Queue,
+    options: PauseOptions,
+    wasPaused: boolean,
+  ): Promise<QueuePauseInfo> {
+    const existing = wasPaused ? await this.getPauseInfo(queue) : undefined;
+    const info: QueuePauseInfo = {
+      reason: options.reason,
+      pausedAt: existing?.pausedAt ?? new Date().toISOString(),
+      until: options.until,
+      source: options.source ?? 'api',
+    };
+    const client = await queue.client;
+    await client.set(this.getPauseReasonKey(queue.name), encodePauseNote(info));
+    return info;
+  }
+
+  private static describePause(info: QueuePauseInfo): string {
+    const parts = [info.reason ? `reason: ${info.reason}` : 'no reason'];
+    if (info.until) parts.push(`until ${info.until}`);
+    return parts.join(', ');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-resume for timed pauses
+  // ---------------------------------------------------------------------------
+
+  private autoResumeTimer: NodeJS.Timeout | null = null;
+  private autoResumeInProgress = false;
+
+  /**
+   * Start the ticker that resumes queues whose pause `until` has passed.
+   * Runs only when the pause endpoint is on and the queues are known.
+   */
+  private startAutoResume(): void {
+    if (this.autoResumeTimer) return;
+    if (!this.enabledEndpoints.has('pause') || !this.getQueues) return;
+
+    this.autoResumeTimer = setInterval(() => {
+      void this.resumeExpiredPauses();
+    }, PAUSE_AUTO_RESUME_INTERVAL_MS);
+    this.autoResumeTimer.unref?.();
+  }
+
+  /**
+   * One pass of the ticker. Exposed for tests and for callers that want to
+   * run it on their own schedule.
+   */
+  async resumeExpiredPauses(now: number = Date.now()): Promise<string[]> {
+    if (this.autoResumeInProgress || this.isShuttingDown || !this.getQueues) {
+      return [];
+    }
+    this.autoResumeInProgress = true;
+    const resumed: string[] = [];
+
+    try {
+      for (const [statsKey, { queue }] of this.getQueues()) {
+        try {
+          if (!(await queue.isPaused())) continue;
+          const info = await this.getPauseInfo(queue);
+          if (!isPauseExpired(info, now)) continue;
+
+          await this.resumeQueue(queue, statsKey);
+          this.logger.log(
+            `Queue ${statsKey} resumed automatically (pause was until ${info?.until})`,
+          );
+          resumed.push(statsKey);
+        } catch (error) {
+          this.logger.warn(
+            `Failed to check timed pause for queue ${statsKey}: ${error}`,
+          );
+        }
+      }
+    } finally {
+      this.autoResumeInProgress = false;
+    }
+
+    return resumed;
   }
 
   /**
@@ -632,6 +771,7 @@ export class QueuebertService implements OnModuleDestroy {
       queue.isPaused(),
       this.getWorkerPresence(queue),
     ]);
+    const pause = paused ? await this.getPauseInfo(queue) : undefined;
 
     const processorStats = processor?.getProcessorStats();
 
@@ -697,6 +837,7 @@ export class QueuebertService implements OnModuleDestroy {
     return {
       name: statsKey ?? queue.name,
       paused,
+      ...(pause ? { pause } : {}),
       counts,
       jobMetrics: {
         duration: {
@@ -1133,27 +1274,39 @@ export class QueuebertService implements OnModuleDestroy {
   }
 
   /**
-   * Pause a queue
+   * Pause a queue and store a note about it.
+   *
+   * Pausing a queue that is already paused only updates the note and keeps
+   * the original `pausedAt`, which is how a client attaches a reason after
+   * the pause itself has happened.
+   *
    * @param queue The BullMQ queue to pause
-   * @param reason Optional pause reason
+   * @param options The reason, auto-resume time and source; a bare string is
+   *   accepted as the reason for older callers
    * @param statsKey Optional statsKey to use in response (defaults to queue.name)
    */
   async pauseQueue(
     queue: Queue,
-    reason = 'manual-pause',
+    options: PauseOptions | string = {},
     statsKey?: string,
   ): Promise<StatusResult> {
-    await queue.pause();
+    const resolved =
+      typeof options === 'string' ? { reason: options } : options;
 
-    const client = await queue.client;
-    await client.set(this.getPauseReasonKey(queue.name), reason);
+    const wasPaused = await queue.isPaused();
+    if (!wasPaused) await queue.pause();
+
+    const info = await this.writePauseNote(queue, resolved, wasPaused);
 
     const displayName = statsKey ?? queue.name;
-    this.logger.warn(`Queue ${displayName} paused (reason: ${reason})`);
+    this.logger.warn(
+      `Queue ${displayName} ${wasPaused ? 'pause note updated' : 'paused'} (${QueuebertService.describePause(info)})`,
+    );
 
     return {
       status: 'paused',
-      reason,
+      ...(info.reason ? { reason: info.reason } : {}),
+      ...(info.until ? { until: info.until } : {}),
       queues: [displayName],
       timestamp: new Date().toISOString(),
     };
@@ -1181,31 +1334,36 @@ export class QueuebertService implements OnModuleDestroy {
   }
 
   /**
-   * Pause multiple queues
+   * Pause multiple queues with the same note.
    * @param queuesWithKeys Array of queue objects with their statsKeys
-   * @param reason Optional pause reason
+   * @param options The reason, auto-resume time and source; a bare string is
+   *   accepted as the reason for older callers
    */
   async pauseQueues(
     queuesWithKeys: Array<{ queue: Queue; statsKey: string }>,
-    reason = 'manual-pause',
+    options: PauseOptions | string = {},
   ): Promise<StatusResult> {
-    await Promise.all(queuesWithKeys.map(({ queue }) => queue.pause()));
+    const resolved =
+      typeof options === 'string' ? { reason: options } : options;
 
-    await Promise.all(
+    const notes = await Promise.all(
       queuesWithKeys.map(async ({ queue }) => {
-        const client = await queue.client;
-        return client.set(this.getPauseReasonKey(queue.name), reason);
+        const wasPaused = await queue.isPaused();
+        if (!wasPaused) await queue.pause();
+        return this.writePauseNote(queue, resolved, wasPaused);
       }),
     );
 
     const queueNames = queuesWithKeys.map(({ statsKey }) => statsKey);
-    this.logger.warn(
-      `Queues paused (reason: ${reason}): ${queueNames.join(', ')}`,
-    );
+    const summary = notes[0]
+      ? QueuebertService.describePause(notes[0])
+      : 'no queues';
+    this.logger.warn(`Queues paused (${summary}): ${queueNames.join(', ')}`);
 
     return {
       status: 'paused',
-      reason,
+      ...(resolved.reason ? { reason: resolved.reason } : {}),
+      ...(resolved.until ? { until: resolved.until } : {}),
       queues: queueNames,
       timestamp: new Date().toISOString(),
     };
@@ -1824,21 +1982,51 @@ export class QueuebertService implements OnModuleDestroy {
   private async pauseQueuesForMigration(
     sourceQueue: Queue,
     targetQueue: Queue,
+    migrationId?: string,
   ): Promise<MigrationQueueGuard> {
     const [sourceWasPaused, targetWasPaused] = await Promise.all([
       sourceQueue.isPaused(),
       targetQueue.isPaused(),
     ]);
 
+    // Pauses the migration performs carry a note saying so, so someone
+    // opening the dashboard mid-migration sees why. A queue that was already
+    // paused keeps whatever note it had.
+    const note: PauseOptions = {
+      reason: migrationId ? `Migration ${migrationId}` : 'Migration',
+      source: 'migration',
+    };
+    const pauseFor = async (queue: Queue) => {
+      await queue.pause();
+      try {
+        await this.writePauseNote(queue, note, false);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to write migration pause note for queue ${queue.name}: ${error}`,
+        );
+      }
+    };
+    const resumeFor = async (queue: Queue) => {
+      await queue.resume();
+      try {
+        const client = await queue.client;
+        await client.del(this.getPauseReasonKey(queue.name));
+      } catch (error) {
+        this.logger.warn(
+          `Failed to clear migration pause note for queue ${queue.name}: ${error}`,
+        );
+      }
+    };
+
     await Promise.all([
-      sourceWasPaused ? Promise.resolve() : sourceQueue.pause(),
-      targetWasPaused ? Promise.resolve() : targetQueue.pause(),
+      sourceWasPaused ? Promise.resolve() : pauseFor(sourceQueue),
+      targetWasPaused ? Promise.resolve() : pauseFor(targetQueue),
     ]);
 
     const activeCount = await sourceQueue.getActiveCount();
     if (activeCount > 0) {
-      if (!targetWasPaused) await targetQueue.resume();
-      if (!sourceWasPaused) await sourceQueue.resume();
+      if (!targetWasPaused) await resumeFor(targetQueue);
+      if (!sourceWasPaused) await resumeFor(sourceQueue);
       throw new Error(
         `Source queue '${sourceQueue.name}' still has ${activeCount} active job(s); retry after they finish`,
       );
@@ -1847,8 +2035,8 @@ export class QueuebertService implements OnModuleDestroy {
     return {
       restore: async (leavePaused: boolean) => {
         if (leavePaused) return;
-        if (!targetWasPaused) await targetQueue.resume();
-        if (!sourceWasPaused) await sourceQueue.resume();
+        if (!targetWasPaused) await resumeFor(targetQueue);
+        if (!sourceWasPaused) await resumeFor(sourceQueue);
       },
     };
   }
@@ -2466,7 +2654,11 @@ export class QueuebertService implements OnModuleDestroy {
 
     try {
       lease = await this.acquireMigrationLease(sourceQueue, sourceRedisId);
-      queueGuard = await this.pauseQueuesForMigration(sourceQueue, targetQueue);
+      queueGuard = await this.pauseQueuesForMigration(
+        sourceQueue,
+        targetQueue,
+        migrationId,
+      );
 
       for (const state of states) {
         // Check for cancellation

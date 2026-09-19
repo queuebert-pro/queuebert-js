@@ -163,6 +163,40 @@ Supported optional endpoints are:
 exposes aggregates, it returns per-job identifiers, failure reasons, and stack
 traces.
 
+### Pause notes
+
+`POST /pause` and `POST /:queueName/pause` accept an optional JSON body
+saying why, and for how long:
+
+```json
+{ "reason": "Deploying api v2.3", "until": "2026-09-19T05:30:00.000Z" }
+```
+
+`reason` is trimmed and limited to 200 characters; longer is a 400 rather
+than a silent cut. `until` must be in the future and at most 7 days out.
+Posting a pause to a queue that is already paused only updates the note and
+keeps the original `pausedAt`, which is how a client attaches a reason after
+the pause itself. Resume clears the note.
+
+While a queue is paused, stats carry the note beside `paused`:
+
+```json
+"paused": true,
+"pause": {
+  "reason": "Deploying api v2.3",
+  "pausedAt": "2026-09-19T04:55:12.000Z",
+  "until": "2026-09-19T05:30:00.000Z",
+  "source": "api"
+}
+```
+
+`source` is `api` for the endpoints and `migration` for the pauses a
+migration performs. A queue paused outside Queuebert reports `paused: true`
+with no note. Capabilities report `canPauseWithReason` when the endpoints
+take a body, and `canPauseUntil` when the module honours `until` by resuming
+the queue itself: it checks every 30 seconds when the `pause` endpoint is
+enabled.
+
 ## Job Inspection
 
 Enable the `jobs` endpoint to read individual jobs, which is the fastest way to
