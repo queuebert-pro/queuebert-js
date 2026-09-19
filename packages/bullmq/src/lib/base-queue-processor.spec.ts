@@ -1,3 +1,4 @@
+import { WorkerStopReason } from '@queuebert/nest';
 import { UnrecoverableError } from 'bullmq';
 
 import {
@@ -108,6 +109,16 @@ class LifecycleProcessor extends TestProcessor {
 
   protected override getCustomLogLines() {
     return ['custom heartbeat line'];
+  }
+}
+
+/**
+ * Presence writes settle over several microtask turns (client lookup, then
+ * the MULTI), so a single resolved promise is not enough to observe them.
+ */
+async function flush(turns = 30): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await Promise.resolve();
   }
 }
 
@@ -597,6 +608,207 @@ describe('BaseQueueProcessor', () => {
         completed: 0,
         failed: 1,
       });
+    });
+  });
+
+  describe('worker stop reasons', () => {
+    function createPresenceRedis() {
+      const strings = new Map<string, string>();
+      const hashes = new Map<string, Map<string, string>>();
+      const redis = createEventTargetMock() as any;
+      redis.llen = jest.fn().mockResolvedValue(0);
+      redis.hgetall = jest.fn(async (key: string) =>
+        Object.fromEntries(hashes.get(key) ?? []),
+      );
+      redis.hset = jest.fn(
+        async (key: string, field: string, value: string) => {
+          const hash = hashes.get(key) ?? new Map<string, string>();
+          hash.set(field, value);
+          hashes.set(key, hash);
+        },
+      );
+      redis.hdel = jest.fn(async (key: string, ...fields: string[]) => {
+        for (const field of fields) hashes.get(key)?.delete(field);
+      });
+      redis.get = jest.fn(async (key: string) => strings.get(key) ?? null);
+      redis.set = jest.fn(async (key: string, value: string) => {
+        strings.set(key, value);
+      });
+      redis.multi = jest.fn(() => {
+        const ops: Array<() => Promise<void>> = [];
+        const chain = {
+          set: (key: string, value: string) => {
+            ops.push(() => redis.set(key, value));
+            return chain;
+          },
+          hdel: (key: string, ...fields: string[]) => {
+            ops.push(() => redis.hdel(key, ...fields));
+            return chain;
+          },
+          exec: async () => {
+            for (const op of ops) await op();
+          },
+        };
+        return chain;
+      });
+      redis.strings = strings;
+      redis.hashes = hashes;
+      return redis;
+    }
+
+    class StopAwareProcessor extends TestProcessor {
+      public stops: WorkerStopReason[] = [];
+
+      protected override onWorkerStopped(record: { reason: WorkerStopReason }) {
+        this.stops.push(record.reason);
+      }
+    }
+
+    async function setup(options: Partial<BaseQueueProcessorOptions> = {}) {
+      const processor = new StopAwareProcessor(options);
+      const logger = muteLogger(processor);
+      const redis = createPresenceRedis();
+      const worker = createEventTargetMock() as any;
+      worker.client = Promise.resolve(redis);
+      worker.isRunning = jest.fn().mockReturnValue(true);
+      worker.run = jest.fn().mockResolvedValue(undefined);
+      worker.opts = { prefix: 'bull' };
+      attachWorker(processor, worker);
+      await processor.onModuleInit();
+      return { processor, logger, redis, worker };
+    }
+
+    function lastStop(redis: any) {
+      const raw = redis.strings.get('bull:emails:qb:last-stop');
+      return raw ? JSON.parse(raw) : null;
+    }
+
+    it('registers presence on init and records a shutdown on destroy', async () => {
+      const { processor, redis } = await setup();
+
+      const live = redis.hashes.get('bull:emails:qb:workers');
+      expect(live?.size).toBe(1);
+
+      await processor.onModuleDestroy();
+
+      expect(redis.hashes.get('bull:emails:qb:workers')?.size).toBe(0);
+      expect(lastStop(redis)).toMatchObject({
+        reason: 'shutdown',
+        description: 'Process shutting down',
+        jobsProcessed: 0,
+      });
+      expect(processor.stops).toEqual([WorkerStopReason.Shutdown]);
+      expect(processor.getLastWorkerStop()?.reason).toBe(
+        WorkerStopReason.Shutdown,
+      );
+    });
+
+    it('blames a lost connection when the worker closes disconnected', async () => {
+      jest.useFakeTimers();
+      const { processor, redis, worker, logger } = await setup({
+        maxWorkerRestartAttempts: 1,
+        workerRestartDelay: 10,
+      });
+
+      redis.handlers['end']();
+      worker.handlers['error'](new Error('Connection is closed.'));
+      worker.handlers['closed']();
+      await flush();
+
+      expect(lastStop(redis)).toMatchObject({ reason: 'lost_connection' });
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('Lost connection to Redis'),
+      );
+      expect(processor.getProcessorStats().custom?.['worker']).toMatchObject({
+        lastStopReason: 'lost_connection',
+      });
+
+      await processor.onModuleDestroy();
+      // The earlier, more specific reason is kept over the orderly shutdown
+      expect(lastStop(redis)).toMatchObject({ reason: 'lost_connection' });
+      expect(processor.stops).toEqual([WorkerStopReason.LostConnection]);
+    });
+
+    it('blames a recent error and otherwise reports unknown', async () => {
+      const first = await setup();
+      first.worker.handlers['error'](new Error('boom'));
+      (first.processor as any).isShuttingDown = true;
+      first.worker.handlers['closed']();
+      await flush();
+      // Shutdown wins even over a fresh error
+      expect(lastStop(first.redis)).toMatchObject({ reason: 'shutdown' });
+      await first.processor.onModuleDestroy();
+
+      jest.useFakeTimers();
+      // Recovery is scheduled but never runs, so the close's own verdict stands
+      const second = await setup({
+        maxWorkerRestartAttempts: 1,
+        workerRestartDelay: 10_000,
+      });
+      second.worker.handlers['error'](new Error('boom'));
+      second.worker.handlers['closed']();
+      await flush();
+      expect(lastStop(second.redis)).toMatchObject({ reason: 'error' });
+      await second.processor.onModuleDestroy();
+    });
+
+    it('re-registers after a successful recovery', async () => {
+      jest.useFakeTimers();
+      const { processor, redis, worker } = await setup({
+        maxWorkerRestartAttempts: 2,
+        workerRestartDelay: 25,
+      });
+      worker.isRunning.mockReturnValue(false);
+
+      worker.handlers['closed']();
+      await flush();
+      expect(redis.hashes.get('bull:emails:qb:workers')?.size).toBe(0);
+      expect(lastStop(redis)).toMatchObject({ reason: 'unknown' });
+
+      await jest.advanceTimersByTimeAsync(25);
+
+      expect(worker.run).toHaveBeenCalledTimes(1);
+      expect(redis.hashes.get('bull:emails:qb:workers')?.size).toBe(1);
+
+      await processor.onModuleDestroy();
+      expect(lastStop(redis)).toMatchObject({ reason: 'shutdown' });
+    });
+
+    it('records exhausted recovery as the final verdict', async () => {
+      jest.useFakeTimers();
+      const { processor, redis, worker } = await setup({
+        maxWorkerRestartAttempts: 1,
+        workerRestartDelay: 10,
+      });
+      worker.isRunning.mockReturnValue(false);
+      worker.run.mockRejectedValue(new Error('still down'));
+
+      worker.handlers['closed']();
+      await flush();
+      await jest.advanceTimersByTimeAsync(10);
+      await flush();
+
+      expect(lastStop(redis)).toMatchObject({ reason: 'recovery_failed' });
+      expect(processor.stops).toEqual([
+        WorkerStopReason.Unknown,
+        WorkerStopReason.RecoveryFailed,
+      ]);
+
+      await processor.onModuleDestroy();
+    });
+
+    it('keeps working when the client cannot hold presence', async () => {
+      const processor = new StopAwareProcessor();
+      muteLogger(processor);
+      const worker = createEventTargetMock() as any;
+      worker.client = Promise.resolve({ llen: jest.fn().mockResolvedValue(0) });
+      worker.isRunning = jest.fn().mockReturnValue(true);
+      attachWorker(processor, worker);
+
+      await processor.onModuleInit();
+      await processor.onModuleDestroy();
+
+      expect(processor.stops).toEqual([WorkerStopReason.Shutdown]);
     });
   });
 });

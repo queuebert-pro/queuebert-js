@@ -17,7 +17,16 @@ export type {
   QueuebertQueueInterface,
   QueuebertBullMQModuleOptions,
   QueuebertBullMQModuleAsyncOptions,
+  WorkerStopListener,
 } from './lib/types';
+
+// Worker stop reasons, shared with @queuebert/nest which reports them
+export {
+  WorkerStopReason,
+  describeWorkerStopReason,
+  classifyWorkerStop,
+} from '@queuebert/nest';
+export type { WorkerStopRecord, QueueWorkersStats } from '@queuebert/nest';
 
 // Injection tokens
 export {

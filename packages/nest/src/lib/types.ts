@@ -273,6 +273,54 @@ export interface QueueLastFailure {
   finishedOn?: number;
 }
 
+/**
+ * Why a worker stopped, chosen by the worker itself when it closes.
+ *
+ * Modelled on Laravel's `WorkerStopReason`, limited to the exits BullMQ
+ * can actually produce. A paused worker keeps running and never reports one.
+ */
+export enum WorkerStopReason {
+  /** The process is shutting down (module destroy, SIGTERM). */
+  Shutdown = 'shutdown',
+  /** Application code closed the worker. */
+  Closed = 'closed',
+  /** The Redis connection ended and the worker did not recover. */
+  LostConnection = 'lost_connection',
+  /** Automatic restart attempts were exhausted. */
+  RecoveryFailed = 'recovery_failed',
+  /** The worker closed shortly after reporting an error. */
+  Error = 'error',
+  /** The worker went away without saying why, e.g. a killed process. */
+  Unknown = 'unknown',
+}
+
+/**
+ * The last stop recorded for a queue's workers.
+ */
+export interface WorkerStopRecord {
+  workerId: string;
+  host?: string;
+  reason: WorkerStopReason;
+  /** One human sentence for the reason, shared by logs, the API and apps */
+  description: string;
+  /** When the worker stopped (ISO 8601) */
+  at: string;
+  jobsProcessed?: number;
+  lastJobAt?: string | null;
+}
+
+/**
+ * Worker presence for a queue: how many Queuebert workers are alive and why
+ * the last one stopped.
+ *
+ * Omitted from stats entirely when no Queuebert worker has ever registered
+ * on the queue, so "no workers" and "not reported" stay distinguishable.
+ */
+export interface QueueWorkersStats {
+  count: number;
+  lastStop?: WorkerStopRecord;
+}
+
 export interface SingleQueueStats {
   name: string;
   /** Redis instance ID this queue belongs to */
@@ -291,6 +339,11 @@ export interface SingleQueueStats {
    * round-trip per queue with a non-zero failed count.
    */
   lastFailure?: QueueLastFailure | null;
+  /**
+   * Live worker count and the last recorded stop, when Queuebert workers
+   * report presence on this queue. Absent otherwise.
+   */
+  workers?: QueueWorkersStats;
   custom?: Record<string, unknown>;
 }
 

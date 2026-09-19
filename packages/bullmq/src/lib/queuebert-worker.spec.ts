@@ -21,6 +21,16 @@ jest.mock('bullmq', () => {
   };
 });
 
+/**
+ * Presence writes settle over several microtask turns (client lookup, then
+ * the MULTI), so a single resolved promise is not enough to observe them.
+ */
+async function flush(turns = 30): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await Promise.resolve();
+  }
+}
+
 describe('QueuebertWorker', () => {
   let worker: QueuebertWorker;
   let mockProcessor: jest.Mock;
@@ -190,6 +200,59 @@ describe('QueuebertWorker', () => {
       await worker.close(true);
 
       expect(mockBullMQWorker.close).toHaveBeenCalledWith(true);
+    });
+
+    it('records an application close and tells listeners once', async () => {
+      const listener = jest.fn();
+      worker.onStopped(listener);
+
+      await worker.close();
+      // BullMQ's own closed event arriving afterwards must not double up
+      const closedHandler = mockBullMQWorker.on.mock.calls.find(
+        ([event]: [string]) => event === 'closed',
+      )?.[1];
+      closedHandler?.();
+      await flush();
+
+      expect(worker.lastStop).toMatchObject({
+        reason: 'closed',
+        description: 'Closed by the application',
+        jobsProcessed: 0,
+      });
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith(worker.lastStop);
+    });
+
+    it('records a shutdown when closed through shutdown()', async () => {
+      await worker.shutdown();
+
+      expect(mockBullMQWorker.close).toHaveBeenCalled();
+      expect(worker.lastStop?.reason).toBe('shutdown');
+    });
+
+    it('blames a lost connection when BullMQ closes the worker itself', async () => {
+      const handlers = Object.fromEntries(
+        mockBullMQWorker.on.mock.calls.map(
+          ([event, handler]: [string, any]) => [event, handler],
+        ),
+      );
+
+      handlers['ioredis:close']();
+      handlers['closed']();
+      await flush();
+
+      expect(worker.isRunning).toBe(false);
+      expect(worker.lastStop?.reason).toBe('lost_connection');
+    });
+
+    it('drops a stop listener', async () => {
+      const listener = jest.fn();
+      worker.onStopped(listener);
+      worker.offStopped(listener);
+
+      await worker.close();
+
+      expect(listener).not.toHaveBeenCalled();
     });
   });
 

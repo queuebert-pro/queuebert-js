@@ -1,4 +1,5 @@
 import type { InjectionToken, OptionalFactoryDependency } from '@nestjs/common';
+import type { WorkerStopRecord } from '@queuebert/nest';
 import type {
   Job,
   Queue,
@@ -15,6 +16,14 @@ import type {
  * wants genuine failures should filter on `isFinalAttempt` rather than
  * assuming 'job:failed' means the job is finished.
  */
+/**
+ * Called with the stop record when a QueuebertWorker stops, the same object
+ * it wrote to Redis for `/stats` to report.
+ */
+export type WorkerStopListener = (
+  record: WorkerStopRecord,
+) => void | Promise<void>;
+
 export type JobLifecycleEvent =
   | 'job:started'
   | 'job:completed'

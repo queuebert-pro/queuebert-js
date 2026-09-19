@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { Job, Queue } from 'bullmq';
 
 import type { QueuebertIntegrationRegistry } from './integration-registry';
+import { isPresenceRedis, readWorkerPresence } from './worker-presence';
 import {
   QUEUEBERT_OPTIONS,
   QUEUEBERT_INTEGRATION_REGISTRY,
@@ -19,6 +20,7 @@ import type {
   QueueCounts,
   SingleQueueStats,
   QueueLastFailure,
+  QueueWorkersStats,
   MultiQueueStats,
   CleanResult,
   DrainResult,
@@ -625,9 +627,10 @@ export class QueuebertService implements OnModuleDestroy {
     processor?: QueuebertProcessor,
     statsKey?: string,
   ): Promise<Omit<SingleQueueStats, 'redis'>> {
-    const [counts, paused] = await Promise.all([
+    const [counts, paused, workers] = await Promise.all([
       this.getQueueCounts(queue),
       queue.isPaused(),
+      this.getWorkerPresence(queue),
     ]);
 
     const processorStats = processor?.getProcessorStats();
@@ -724,8 +727,33 @@ export class QueuebertService implements OnModuleDestroy {
       },
       jobTypes,
       ...(lastFailure !== undefined ? { lastFailure } : {}),
+      ...(workers ? { workers } : {}),
       custom: processorStats?.custom,
     };
+  }
+
+  /**
+   * Worker presence for a queue, or undefined when nothing Queuebert-aware
+   * has ever served it, so the field is omitted rather than reported as zero.
+   *
+   * Two small reads per queue on the queue's own connection; any failure
+   * leaves stats without the field rather than failing the request.
+   */
+  private async getWorkerPresence(
+    queue: Queue,
+  ): Promise<QueueWorkersStats | undefined> {
+    try {
+      const client = await queue.client;
+      if (!isPresenceRedis(client)) return undefined;
+      return await readWorkerPresence(client, queue.name, {
+        prefix: queue.opts?.prefix,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to read worker presence for queue ${queue.name}: ${error}`,
+      );
+      return undefined;
+    }
   }
 
   /**

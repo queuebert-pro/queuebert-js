@@ -1099,4 +1099,95 @@ describe('job inspection', () => {
       expect(stats.lastFailure).toBeNull();
     });
   });
+
+  describe('workers on queue stats', () => {
+    function presenceQueue(
+      redis: Record<string, jest.Mock>,
+      overrides: Record<string, unknown> = {},
+    ) {
+      return createQueue({
+        isPaused: jest.fn().mockResolvedValue(false),
+        getWaitingCount: jest.fn().mockResolvedValue(0),
+        getActiveCount: jest.fn().mockResolvedValue(0),
+        getCompletedCount: jest.fn().mockResolvedValue(0),
+        getFailedCount: jest.fn().mockResolvedValue(0),
+        getDelayedCount: jest.fn().mockResolvedValue(0),
+        client: Promise.resolve(redis),
+        opts: { prefix: 'bull' },
+        ...overrides,
+      });
+    }
+
+    function presenceRedis(
+      workers: Record<string, string>,
+      lastStop: string | null,
+    ) {
+      return {
+        hgetall: jest.fn().mockResolvedValue(workers),
+        get: jest.fn().mockResolvedValue(lastStop),
+        hset: jest.fn(),
+        hdel: jest.fn().mockResolvedValue(0),
+        set: jest.fn().mockResolvedValue('OK'),
+        multi: jest.fn(),
+      };
+    }
+
+    it('is omitted when the queue has no presence', async () => {
+      const service = createService();
+      const queue = presenceQueue(presenceRedis({}, null));
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats).not.toHaveProperty('workers');
+    });
+
+    it('is omitted when the queue has no usable client', async () => {
+      const service = createService();
+      const queue = presenceQueue({}, { client: undefined });
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats).not.toHaveProperty('workers');
+    });
+
+    it('reports the live count and the last stop', async () => {
+      const service = createService();
+      const stop = {
+        workerId: 'api-1:42:abc',
+        host: 'api-1',
+        reason: 'lost_connection',
+        description: 'Lost connection to Redis',
+        at: '2026-09-19T12:00:00.000Z',
+      };
+      const live = JSON.stringify({
+        host: 'api-2',
+        pid: 7,
+        startedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+      });
+      const redis = presenceRedis(
+        { 'api-2:7:xyz': live },
+        JSON.stringify(stop),
+      );
+      const queue = presenceQueue(redis);
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats.workers).toEqual({ count: 1, lastStop: stop });
+      expect(redis.hgetall).toHaveBeenCalledWith('bull:emails:qb:workers');
+    });
+
+    it('leaves stats without the field when the read fails', async () => {
+      const service = createService();
+      const redis = presenceRedis({}, null);
+      redis.hgetall.mockRejectedValue(new Error('redis down'));
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const queue = presenceQueue(redis);
+
+      const stats = await service.getSingleQueueStats(queue as never);
+
+      expect(stats).not.toHaveProperty('workers');
+      expect(stats.counts.waiting).toBe(0);
+    });
+  });
 });

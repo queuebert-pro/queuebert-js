@@ -178,6 +178,30 @@ QueuebertModule.forRoot({
 });
 ```
 
+### Worker stop reasons
+
+Every worker registers presence in Redis while it runs and records why it
+stopped when it goes, in the style of Laravel's `WorkerStopReason`, so the
+`/stats` endpoint from `@queuebert/nest` can report a live worker count per
+queue and explain the last exit. Nothing needs configuring.
+
+`BaseQueueProcessor` classifies a close from what it saw around it: a
+shutdown, a lost Redis connection, exhausted recovery, a recent worker error,
+or nothing it can name. Override `onWorkerStopped` to report it:
+
+```ts
+protected override onWorkerStopped(record: WorkerStopRecord) {
+  if (record.reason !== WorkerStopReason.Shutdown) {
+    Sentry.captureMessage(`Worker stopped: ${record.description}`);
+  }
+}
+```
+
+`QueuebertWorker` does the same, with `onStopped(listener)` and a `lastStop`
+getter. Use `shutdown()` rather than `close()` when the process is exiting so
+the stop is recorded as a shutdown; `QueuebertBullMQService` already does on
+module destroy.
+
 ### Failure retention
 
 When configuring `removeOnFail`, prefer the time-based form

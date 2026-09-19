@@ -1,4 +1,10 @@
 import { Logger } from '@nestjs/common';
+import {
+  classifyWorkerStop,
+  WorkerPresence,
+  WorkerStopReason,
+  type WorkerStopRecord,
+} from '@queuebert/nest';
 import { Worker, Job, Processor } from 'bullmq';
 
 import { resolveRetryOutcome, trackDiscard } from './retry-outcome';
@@ -11,6 +17,7 @@ import type {
   JobLifecycleListener,
   JobLifecycleEventData,
   JobDurationRecord,
+  WorkerStopListener,
 } from './types';
 
 const OTHER_JOB_NAME = '__other__';
@@ -38,6 +45,15 @@ export class QueuebertWorker<
   private _isRunning = false;
   private _isPaused = false;
   private activeJobCount = 0;
+
+  // Presence and stop reasons
+  private readonly presence: WorkerPresence;
+  private _lastStop: WorkerStopRecord | null = null;
+  private closeRequested = false;
+  private shuttingDown = false;
+  private connectionLost = false;
+  private lastErrorAt: number | null = null;
+  private stopListeners = new Set<WorkerStopListener>();
   private lastJobTime: Date | null = null;
   private jobNameSet = new Set<string>();
 
@@ -80,6 +96,21 @@ export class QueuebertWorker<
     this.setupWorkerEvents();
 
     this._isRunning = true;
+
+    // Announce this worker so stats can count it and explain its exit.
+    this.presence = new WorkerPresence({
+      queueName,
+      prefix: workerOptions.prefix,
+      getClient: () => this._worker.client,
+      counters: () => ({
+        jobsProcessed: this.statsCollector.getTotals().processed,
+        lastJobAt: this.lastJobTime?.toISOString() ?? null,
+      }),
+      onError: (error) => {
+        this.logger.warn(`Failed to write worker presence: ${error}`);
+      },
+    });
+    void this.presence.start();
   }
 
   /**
@@ -108,6 +139,27 @@ export class QueuebertWorker<
    */
   get worker(): Worker<T, R> {
     return this._worker;
+  }
+
+  /**
+   * The last stop recorded for this worker, or null while it has not stopped
+   */
+  get lastStop(): WorkerStopRecord | null {
+    return this._lastStop;
+  }
+
+  /**
+   * Subscribe to the worker stopping, with the same record written to Redis
+   */
+  onStopped(listener: WorkerStopListener): void {
+    this.stopListeners.add(listener);
+  }
+
+  /**
+   * Unsubscribe from the worker stopping
+   */
+  offStopped(listener: WorkerStopListener): void {
+    this.stopListeners.delete(listener);
   }
 
   /**
@@ -176,12 +228,26 @@ export class QueuebertWorker<
   }
 
   /**
-   * Close the worker
+   * Close the worker. Recorded as a stop by the application, unless
+   * `shutdown()` was used.
    */
   async close(force?: boolean): Promise<void> {
+    this.closeRequested = true;
     this._isRunning = false;
     this.statsCollector.destroy();
     await this._worker.close(force);
+    await this.recordStop(
+      this.shuttingDown ? WorkerStopReason.Shutdown : WorkerStopReason.Closed,
+    );
+  }
+
+  /**
+   * Close the worker because the process is shutting down, so the stop is
+   * recorded as a shutdown rather than an application close.
+   */
+  async shutdown(force?: boolean): Promise<void> {
+    this.shuttingDown = true;
+    await this.close(force);
   }
 
   /**
@@ -368,9 +434,59 @@ export class QueuebertWorker<
 
     // Listen for errors
     this._worker.on('error', (error: Error) => {
+      this.lastErrorAt = Date.now();
       // Log error but don't crash
       this.logger.error('Worker error', error.stack);
     });
+
+    // Track the connection so a close that follows it is explained by it
+    this._worker.on('ioredis:close', () => {
+      this.connectionLost = true;
+    });
+    this._worker.on('ready', () => {
+      this.connectionLost = false;
+    });
+
+    // Record why the worker went, however it went
+    this._worker.on('closed', () => {
+      void this.recordStop(
+        classifyWorkerStop({
+          shuttingDown: this.shuttingDown,
+          closeRequested: this.closeRequested,
+          connectionLost: this.connectionLost,
+          lastErrorAt: this.lastErrorAt,
+        }),
+      );
+    });
+  }
+
+  /**
+   * Record a stop once, then tell listeners.
+   */
+  private async recordStop(reason: WorkerStopReason): Promise<void> {
+    const record = await this.presence.recordStop(reason);
+    if (!record) return;
+
+    this._lastStop = record;
+    this._isRunning = false;
+
+    const promises: Promise<void>[] = [];
+    for (const listener of this.stopListeners) {
+      try {
+        const result = listener(record);
+        if (result instanceof Promise) {
+          promises.push(result);
+        }
+      } catch (error) {
+        this.logger.error(
+          'Listener error for worker stop',
+          error instanceof Error ? error.stack : String(error),
+        );
+      }
+    }
+    if (promises.length > 0) {
+      await Promise.allSettled(promises);
+    }
   }
 
   /**

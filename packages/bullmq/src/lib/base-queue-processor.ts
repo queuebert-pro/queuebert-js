@@ -2,10 +2,15 @@ import { WorkerHost } from '@nestjs/bullmq';
 import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Job, Worker } from 'bullmq';
 
-import type {
-  QueuebertProcessor,
-  QueuebertProcessorStats,
-  QueuebertCacheConfig,
+import {
+  classifyWorkerStop,
+  describeWorkerStopReason,
+  WorkerPresence,
+  WorkerStopReason,
+  type QueuebertProcessor,
+  type QueuebertProcessorStats,
+  type QueuebertCacheConfig,
+  type WorkerStopRecord,
 } from '@queuebert/nest';
 
 import {
@@ -125,6 +130,9 @@ export abstract class BaseQueueProcessor
   private readonly restartDelay: number;
   private isShuttingDown = false;
   private lastWorkerCloseTime: Date | null = null;
+  private lastWorkerErrorAt: number | null = null;
+  private lastWorkerStop: WorkerStopRecord | null = null;
+  private presence: WorkerPresence | null = null;
   protected redisConnectionStatus:
     | 'connected'
     | 'disconnected'
@@ -178,6 +186,9 @@ export abstract class BaseQueueProcessor
     await this.setupRedisConnectionListeners();
     await this.setupWorkerEventListeners();
 
+    // Announce this worker so stats can count it and explain its exit
+    await this.startWorkerPresence();
+
     // Start periodic heartbeat
     this.statsLogInterval = setInterval(() => {
       void this.logStatsSafely();
@@ -197,6 +208,10 @@ export abstract class BaseQueueProcessor
       clearTimeout(this.workerRecoveryTimer);
       this.workerRecoveryTimer = null;
     }
+
+    // A worker that already stopped for a better reason keeps that reason;
+    // this only records the orderly case.
+    await this.recordWorkerStop(WorkerStopReason.Shutdown);
 
     // Let subclass clean up (cache teardown, etc.)
     await this.onProcessorDestroy();
@@ -307,6 +322,16 @@ export abstract class BaseQueueProcessor
     this.logger.error(
       `Worker recovery failed after ${this.maxRestartAttempts} attempts. Manual intervention required.`,
     );
+  }
+
+  /**
+   * Called once a stop has been recorded for this worker, with the same
+   * record that was written to Redis. Override to report it (e.g., Sentry).
+   *
+   * Awaited, and a hook that throws is logged and swallowed.
+   */
+  protected onWorkerStopped(record: WorkerStopRecord): void | Promise<void> {
+    void record;
   }
 
   /**
@@ -489,6 +514,7 @@ export abstract class BaseQueueProcessor
           redisStatus: this.redisConnectionStatus,
           restartAttempts: this.workerRestartAttempts,
           lastCloseTime: this.lastWorkerCloseTime?.toISOString() || null,
+          lastStopReason: this.lastWorkerStop?.reason ?? null,
         },
       },
     };
@@ -568,6 +594,7 @@ export abstract class BaseQueueProcessor
     }
 
     worker.on('error', (err: Error) => {
+      this.lastWorkerErrorAt = Date.now();
       this.onWorkerError(err);
     });
 
@@ -590,7 +617,15 @@ export abstract class BaseQueueProcessor
 
     worker.on('closed', () => {
       this.lastWorkerCloseTime = new Date();
-      this.logger.error('Worker closed - no longer processing jobs');
+      const reason = classifyWorkerStop({
+        shuttingDown: this.isShuttingDown,
+        connectionLost: this.redisConnectionStatus === 'disconnected',
+        lastErrorAt: this.lastWorkerErrorAt,
+      });
+      this.logger.error(
+        `Worker closed (${describeWorkerStopReason(reason)}) - no longer processing jobs`,
+      );
+      void this.recordWorkerStop(reason);
 
       if (!this.isShuttingDown) {
         this.attemptWorkerRecovery();
@@ -615,6 +650,9 @@ export abstract class BaseQueueProcessor
     this.workerRestartAttempts++;
 
     if (this.workerRestartAttempts > this.maxRestartAttempts) {
+      // The final verdict on this worker, replacing the reason its close
+      // event recorded.
+      void this.recordWorkerStop(WorkerStopReason.RecoveryFailed, true);
       this.onWorkerRecoveryExhausted();
       return;
     }
@@ -652,6 +690,7 @@ export abstract class BaseQueueProcessor
         await worker.run();
         this.logger.log('Worker restarted successfully');
         this.workerRestartAttempts = 0;
+        await this.startWorkerPresence();
       } catch (err) {
         this.logger.error(`Worker restart failed: ${err}`);
         this.onWorkerError(err as Error);
@@ -659,6 +698,56 @@ export abstract class BaseQueueProcessor
       }
     }, cappedDelay);
     this.workerRecoveryTimer.unref();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Worker presence and stop reasons
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register (or re-register, after recovery) this worker as live.
+   */
+  private async startWorkerPresence(): Promise<void> {
+    if (!this.presence) {
+      const worker = this.getWorkerOrNull();
+      this.presence = new WorkerPresence({
+        queueName: this.queueName,
+        prefix: worker?.opts?.prefix,
+        getClient: () => this.getRedisClient(),
+        counters: () => ({
+          jobsProcessed: this.jobsProcessed,
+          lastJobAt: this.lastJobTime?.toISOString() ?? null,
+        }),
+        onError: (error) => {
+          this.logger.warn(`Failed to write worker presence: ${error}`);
+        },
+      });
+    }
+    await this.presence.start();
+  }
+
+  /**
+   * Record why the worker stopped, once per stop unless `replace` asks for a
+   * later, more final verdict.
+   */
+  private async recordWorkerStop(
+    reason: WorkerStopReason,
+    replace = false,
+  ): Promise<void> {
+    const record = await this.presence?.recordStop(reason, { replace });
+    if (!record) return;
+
+    this.lastWorkerStop = record;
+    await this.runJobHook('onWorkerStopped', () =>
+      this.onWorkerStopped(record),
+    );
+  }
+
+  /**
+   * The last stop recorded for this worker in this process, if any.
+   */
+  getLastWorkerStop(): WorkerStopRecord | null {
+    return this.lastWorkerStop;
   }
 
   // ---------------------------------------------------------------------------

@@ -245,9 +245,9 @@ export class QueuebertBullMQService implements OnModuleDestroy, OnModuleInit {
       );
     }
 
-    // Close all workers first
+    // Close all workers first, recorded as a shutdown rather than a close
     const workerClosePromises = Array.from(this.workers.values()).map(
-      (worker) => worker.close(),
+      (worker) => worker.shutdown(),
     );
     await Promise.allSettled(workerClosePromises);
     this.workers.clear();

@@ -103,6 +103,38 @@ export class EmailProcessor implements QueuebertProcessor {
 }
 ```
 
+### Worker presence and stop reasons
+
+Workers built on `@queuebert/bullmq` (`BaseQueueProcessor` or
+`QueuebertWorker`) announce themselves under the queue's own key prefix and
+record why they stopped. `/stats` reports both per queue:
+
+```json
+"workers": {
+  "count": 2,
+  "lastStop": {
+    "workerId": "api-7f9c:4132:k3x9q1",
+    "host": "api-7f9c",
+    "reason": "lost_connection",
+    "description": "Lost connection to Redis",
+    "at": "2026-09-19T04:12:30.000Z",
+    "jobsProcessed": 1284,
+    "lastJobAt": "2026-09-19T04:11:58.000Z"
+  }
+}
+```
+
+`reason` is one of `WorkerStopReason`: `shutdown`, `closed`,
+`lost_connection`, `recovery_failed`, `error` or `unknown`. `unknown` is
+what a reader records for a worker whose heartbeat stopped without a stop
+being written, such as a killed process. The field is omitted entirely for a
+queue no Queuebert-aware worker has ever served, so "no workers" and "not
+reported" stay distinguishable.
+
+Presence costs one small hash write per worker every 15 seconds and two
+reads per queue on `/stats`. `readWorkerPresence` and `WorkerPresence` are
+exported for other integrations.
+
 ## Endpoint Controls
 
 `stats` is always enabled. By default, only read-only `metrics` is enabled.

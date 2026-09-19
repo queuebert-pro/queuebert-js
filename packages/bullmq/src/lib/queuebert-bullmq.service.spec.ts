@@ -35,6 +35,7 @@ jest.mock('./queuebert-worker', () => {
       isRunning: true,
       isPaused: false,
       close: jest.fn().mockResolvedValue(undefined),
+      shutdown: jest.fn().mockResolvedValue(undefined),
       pause: jest.fn().mockResolvedValue(undefined),
       resume: jest.fn().mockResolvedValue(undefined),
       getStats: jest.fn().mockReturnValue({
@@ -431,8 +432,9 @@ describe('QueuebertBullMQService', () => {
 
       await service.onModuleDestroy();
 
-      expect(worker1.close).toHaveBeenCalled();
-      expect(worker2.close).toHaveBeenCalled();
+      // Recorded as a shutdown, not an application close
+      expect(worker1.shutdown).toHaveBeenCalled();
+      expect(worker2.shutdown).toHaveBeenCalled();
       expect(queue1.close).toHaveBeenCalled();
       expect(queue2.close).toHaveBeenCalled();
       expect(service.getQueueNames()).toEqual([]);
